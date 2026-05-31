@@ -1,0 +1,330 @@
+#Projection Matrix Calibration for Spherical Manifold DLT
+
+
+import numpy as np
+import pandas as pd
+from pathlib import Path
+
+# USER INPUT
+
+csv_input = input("Enter full path to your CSV file: ").strip().strip('"').strip("'")
+csv_path = Path(csv_input)
+
+if not csv_path.exists():
+    raise FileNotFoundError(f"CSV file not found: {csv_path}")
+
+print(f"Using CSV: {csv_path.resolve()}")
+
+# USER SETTINGS
+
+ROPE_LENGTH_MM = 588.0
+ENCODER_OFFSET_MM = 12.0
+KP_CONF_THRESHOLD = 0.5
+
+ANGLE0_COL = "swing_angle_1_deg"
+ANGLE1_COL = "swing_angle_2_deg"
+
+U_COL = "kp1_x"
+V_COL = "kp1_y"
+CONF_COL = "kp1_conf"
+
+# OUTPUT FOLDER
+
+try:
+    script_dir = Path(__file__).resolve().parent
+except NameError:
+    script_dir = Path.cwd()
+
+trial_name = input("Enter output folder name for this trial: ").strip()
+
+if not trial_name:
+    trial_name = "model_B_normalized_DLT_output"
+
+output_dir = script_dir / trial_name
+output_dir.mkdir(parents=True, exist_ok=True)
+
+print(f"\nOutputs will be saved to: {output_dir}")
+
+# ROTATION MATRICES
+
+def Rx(theta):
+    c = np.cos(theta)
+    s = np.sin(theta)
+    return np.array([
+        [1, 0,  0],
+        [0, c, -s],
+        [0, s,  c]
+    ])
+
+
+def Ry(theta):
+    c = np.cos(theta)
+    s = np.sin(theta)
+    return np.array([
+        [ c, 0, s],
+        [ 0, 1, 0],
+        [-s, 0, c]
+    ])
+
+
+# MODEL B: ENCODER ANGLES → XYZ
+
+def encoder_to_xyz_model_B(swing_angle_1_deg, swing_angle_2_deg):
+
+
+    theta0 = np.deg2rad(swing_angle_1_deg)
+    theta1 = np.deg2rad(swing_angle_2_deg)
+
+
+    C_fixed = np.array([0.0, 0.0, ENCODER_OFFSET_MM / 2.0])
+
+
+    L_eff = ROPE_LENGTH_MM + ENCODER_OFFSET_MM / 2.0
+
+    r_eff = np.array([0.0, 0.0, L_eff])
+
+
+    P_payload = C_fixed + Rx(theta0) @ (Ry(theta1) @ r_eff)
+
+    return P_payload
+
+# NORMALIZATION FUNCTIONS FOR NORMALIZED DLT
+
+def normalize_points_2d(u, v):
+
+
+    pts = np.column_stack([u, v])
+    mean = np.mean(pts, axis=0)
+
+    pts_centered = pts - mean
+    avg_dist = np.mean(np.linalg.norm(pts_centered, axis=1))
+
+    if avg_dist < 1e-12:
+        raise ValueError("2D points have almost no spread. Cannot normalize.")
+
+    scale = np.sqrt(2) / avg_dist
+
+    T = np.array([
+        [scale, 0, -scale * mean[0]],
+        [0, scale, -scale * mean[1]],
+        [0, 0, 1]
+    ])
+
+    pts_h = np.column_stack([pts, np.ones(len(pts))])
+    pts_norm_h = (T @ pts_h.T).T
+
+    return pts_norm_h[:, 0], pts_norm_h[:, 1], T
+
+
+def normalize_points_3d(X, Y, Z):
+
+
+    pts = np.column_stack([X, Y, Z])
+    mean = np.mean(pts, axis=0)
+
+    pts_centered = pts - mean
+    avg_dist = np.mean(np.linalg.norm(pts_centered, axis=1))
+
+    if avg_dist < 1e-12:
+        raise ValueError("3D points have almost no spread. Cannot normalize.")
+
+    scale = np.sqrt(3) / avg_dist
+
+    T = np.array([
+        [scale, 0, 0, -scale * mean[0]],
+        [0, scale, 0, -scale * mean[1]],
+        [0, 0, scale, -scale * mean[2]],
+        [0, 0, 0, 1]
+    ])
+
+    pts_h = np.column_stack([pts, np.ones(len(pts))])
+    pts_norm_h = (T @ pts_h.T).T
+
+    return pts_norm_h[:, 0], pts_norm_h[:, 1], pts_norm_h[:, 2], T
+
+
+# SOLVE PROJECTION MATRIX USING NORMALIZED DLT
+
+def solve_projection_matrix_normalized_dlt(X, Y, Z, u, v):
+
+
+    u_n, v_n, T2D = normalize_points_2d(u, v)
+    X_n, Y_n, Z_n, T3D = normalize_points_3d(X, Y, Z)
+
+    A = []
+
+    for Xi, Yi, Zi, ui, vi in zip(X_n, Y_n, Z_n, u_n, v_n):
+        Xh = np.array([Xi, Yi, Zi, 1.0])
+
+        A.append([
+            0, 0, 0, 0,
+            -Xh[0], -Xh[1], -Xh[2], -Xh[3],
+            vi * Xh[0], vi * Xh[1], vi * Xh[2], vi * Xh[3]
+        ])
+
+        A.append([
+            Xh[0], Xh[1], Xh[2], Xh[3],
+            0, 0, 0, 0,
+            -ui * Xh[0], -ui * Xh[1], -ui * Xh[2], -ui * Xh[3]
+        ])
+
+    A = np.array(A)
+
+
+    _, _, Vt = np.linalg.svd(A)
+    p = Vt[-1]
+
+    P_norm = p.reshape(3, 4)
+
+
+    P = np.linalg.inv(T2D) @ P_norm @ T3D
+
+
+    if abs(P[-1, -1]) > 1e-12:
+        P = P / P[-1, -1]
+    else:
+        P = P / np.linalg.norm(P)
+
+    return P, A
+
+
+# LOAD AND CLEAN CSV
+
+df = pd.read_csv(csv_path)
+
+df = df[
+    (df["detected"] == 1) &
+    (df[CONF_COL] > KP_CONF_THRESHOLD) &
+    df[U_COL].notna() &
+    df[V_COL].notna() &
+    df[ANGLE0_COL].notna() &
+    df[ANGLE1_COL].notna()
+].copy()
+
+print(f"\nValid rows used: {len(df)}")
+
+if len(df) < 6:
+    raise ValueError("Not enough valid rows. Need at least 6 3D-2D point correspondences.")
+
+# COMPUTE XYZ FROM ENCODERS
+
+xyz = []
+
+for _, row in df.iterrows():
+    P_payload = encoder_to_xyz_model_B(
+        row[ANGLE0_COL],
+        row[ANGLE1_COL]
+    )
+    xyz.append(P_payload)
+
+xyz = np.array(xyz)
+
+df["X_mm"] = xyz[:, 0]
+df["Y_mm"] = xyz[:, 1]
+df["Z_mm"] = xyz[:, 2]
+
+print("\nDEBUG: First few rows of angles and XYZ")
+print(df[[ANGLE0_COL, ANGLE1_COL, "X_mm", "Y_mm", "Z_mm"]].head())
+
+print("\nDEBUG: Angle range")
+print(df[[ANGLE0_COL, ANGLE1_COL]].agg(["min", "max"]))
+
+print("\nDEBUG: XYZ range")
+print(df[["X_mm", "Y_mm", "Z_mm"]].agg(["min", "max"]))
+
+# BUILD DATA ARRAYS
+
+X = df["X_mm"].to_numpy()
+Y = df["Y_mm"].to_numpy()
+Z = df["Z_mm"].to_numpy()
+
+u = df[U_COL].to_numpy()
+v = df[V_COL].to_numpy()
+
+# SOLVE NORMALIZED DLT
+
+P, A = solve_projection_matrix_normalized_dlt(X, Y, Z, u, v)
+
+print("\nEstimated Projection Matrix P using NORMALIZED DLT:")
+print(P)
+
+
+cond_A = np.linalg.cond(A)
+print(f"\nCondition number of normalized A: {cond_A:.3e}")
+
+# VALIDATE P BY REPROJECTING XYZ → u,v
+
+X_hom = np.column_stack([
+    df["X_mm"].to_numpy(),
+    df["Y_mm"].to_numpy(),
+    df["Z_mm"].to_numpy(),
+    np.ones(len(df))
+])
+
+proj = (P @ X_hom.T).T
+
+df["u_pred"] = proj[:, 0] / proj[:, 2]
+df["v_pred"] = proj[:, 1] / proj[:, 2]
+
+df["reproj_error_px"] = np.sqrt(
+    (df[U_COL] - df["u_pred"])**2 +
+    (df[V_COL] - df["v_pred"])**2
+)
+
+print("\nReprojection error using NORMALIZED DLT:")
+print(df["reproj_error_px"].describe())
+
+print("\nSample reprojection check:")
+print(df[[U_COL, V_COL, "u_pred", "v_pred", "reproj_error_px"]].head())
+
+# SAVE OUTPUTS
+
+output_csv = output_dir / "model_B_normalized_DLT_with_xyz_and_reprojection.csv"
+output_P = output_dir / "projection_matrix_model_B_normalized_DLT.txt"
+output_summary = output_dir / "model_B_normalized_DLT_summary.txt"
+
+df.to_csv(output_csv, index=False)
+np.savetxt(output_P, P)
+
+with open(output_summary, "w") as f:
+    f.write("MODEL B: Physically accurate moving-center pan-tilt model\n")
+    f.write("Projection Matrix Estimation: NORMALIZED DLT\n")
+    f.write("========================================================\n\n")
+
+    f.write(f"Input CSV: {csv_path}\n")
+    f.write(f"Valid rows used: {len(df)}\n")
+    f.write(f"Rope length: {ROPE_LENGTH_MM} mm\n")
+    f.write(f"Encoder offset: {ENCODER_OFFSET_MM} mm\n")
+    f.write(f"Keypoint used: {U_COL}, {V_COL}\n")
+    f.write(f"Keypoint confidence threshold: {KP_CONF_THRESHOLD}\n")
+    f.write(f"Condition number of normalized A: {cond_A:.6e}\n\n")
+
+    f.write("World frame convention:\n")
+    f.write("+x = south/down in image\n")
+    f.write("+y = west/left in image\n")
+    f.write("+z = into the page\n\n")
+
+    f.write("Encoder convention:\n")
+    f.write("swing_angle_1 / encoder 0: positive = right/east = -y\n")
+    f.write("swing_angle_2 / encoder 1: positive = south/down = +x\n\n")
+
+    f.write("Estimated Projection Matrix P:\n")
+    f.write(np.array2string(P))
+    f.write("\n\n")
+
+    f.write("Angle range:\n")
+    f.write(str(df[[ANGLE0_COL, ANGLE1_COL]].agg(["min", "max"])))
+    f.write("\n\n")
+
+    f.write("XYZ range:\n")
+    f.write(str(df[["X_mm", "Y_mm", "Z_mm"]].agg(["min", "max"])))
+    f.write("\n\n")
+
+    f.write("Reprojection error statistics:\n")
+    f.write(str(df["reproj_error_px"].describe()))
+    f.write("\n")
+
+print("\nSaved:")
+print(output_csv)
+print(output_P)
+print(output_summary)
