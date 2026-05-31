@@ -1,0 +1,1436 @@
+#Off-Drone State Estimation
+
+
+import csv
+import re
+import sys
+import time
+import threading
+from pathlib import Path
+
+import cv2
+import numpy as np
+import spidev
+from ultralytics import YOLO
+
+try:
+    from Focuser import Focuser
+    HAS_FOCUSER = True
+except Exception:
+    HAS_FOCUSER = False
+
+
+# USER SETTINGS — EDIT THESE
+
+MODEL_PATH = "path/to/yolov8s-pose_custom.pt"
+
+
+P_MATRIX_PATH = "path/to/projection_matrix_model_B_normalized_DLT.txt"
+
+ROPE_LENGTH_MM = 588.0
+ENCODER_OFFSET_MM = 12.0
+
+YOLO_CONF_THRESHOLD = 0.50
+KP_CONF_THRESHOLD = 0.50
+YOLO_IMGSZ = 640
+
+
+CENTER_KP_INDEX = 0
+TAB_KP_INDICES = [1, 2, 3, 4, 5]
+TWIST_REFERENCE = "phi"
+
+
+USE_KALMAN_FILTER = True
+KF_DEFAULT_DT = 1.0 / 20.0
+KF_MAX_DT = 0.20
+KF_MIN_DT = 1e-3
+
+
+SAVE_ANNOTATED_VIDEO = False
+ANNOTATED_VIDEO_NAME = "annotated_inference_video.mp4"
+SAVE_INFERENCE_FRAMES = False
+INFERENCE_FRAMES_DIR_NAME = "inference_frames"
+
+
+INFER_EVERY_N_CAPTURED_FRAMES = 2
+
+WIDTH = 1920
+HEIGHT = 1080
+FRAMERATE = 60
+
+GST_PIPELINE = (
+    f"nvarguscamerasrc sensor-id=0 ! "
+    f"video/x-raw(memory:NVMM), width={WIDTH}, height={HEIGHT}, framerate={FRAMERATE}/1 ! "
+    f"nvvidconv ! "
+    f"queue ! "
+    f"video/x-raw, format=BGRx ! "
+    f"videoconvert ! "
+    f"appsink drop=true sync=false max-buffers=1"
+)
+
+SHOW_PREVIEW = True
+DRAW_OVERLAY = False
+
+SAVE_RAW_VIDEO = True
+RAW_TEMP_VIDEO_NAME = "raw_video_temp_wrong_fps.mp4"
+RAW_FINAL_VIDEO_NAME = "raw_video_corrected_fps.mp4"
+
+CSV_NAME = "realtime_modelB_results.csv"
+FRAME_MAP_CSV_NAME = "raw_video_frame_map.csv"
+
+
+USE_FOCUSER = True
+I2C_BUS = 10
+FIXED_FOCUS = 270
+FOCUS_COMMAND_REPEATS = 3
+FOCUS_SETTLE_SEC = 2.0
+
+SPI_BUS = 0
+ENCODER0_CS = 0
+ENCODER1_CS = 1
+SPI_SPEED_HZ = 1_000_000
+SPI_MODE = 0b01
+
+ZERO_SAMPLES = 20
+ZERO_SAMPLE_DELAY_SEC = 0.02
+
+
+# PATH / OUTPUT
+
+def safe_name(name: str) -> str:
+    name = name.strip().replace("/", "_").replace("\\", "_")
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", name) or "realtime_modelB_run"
+
+
+def get_script_dir() -> Path:
+    try:
+        return Path(__file__).resolve().parent
+    except NameError:
+        return Path.cwd()
+
+
+def get_output_dir() -> Path:
+    script_dir = get_script_dir()
+
+    if len(sys.argv) >= 2:
+        folder_name = safe_name(sys.argv[1])
+    else:
+        folder_name = safe_name(input("Enter output folder name: ").strip())
+
+    outdir = script_dir / folder_name
+    outdir.mkdir(parents=True, exist_ok=True)
+    return outdir
+
+
+# ENCODERS
+
+def open_encoder(cs: int) -> spidev.SpiDev:
+    spi = spidev.SpiDev()
+    spi.open(SPI_BUS, cs)
+    spi.max_speed_hz = SPI_SPEED_HZ
+    spi.mode = SPI_MODE
+    return spi
+
+
+def read_angle_raw_deg(spi: spidev.SpiDev) -> float:
+    resp = spi.xfer2([0xFF, 0xFF])
+    raw = (resp[0] << 8) | resp[1]
+    angle14 = raw & 0x3FFF
+    return angle14 * 360.0 / 16384.0
+
+
+def angle_diff_deg(current: float, zero: float) -> float:
+    return (current - zero + 180.0) % 360.0 - 180.0
+
+
+def zero_encoders(spi0: spidev.SpiDev, spi1: spidev.SpiDev):
+    print("[INFO] Zeroing encoders. Keep payload at resting position...", flush=True)
+
+    vals0, vals1 = [], []
+
+    for _ in range(ZERO_SAMPLES):
+        vals0.append(read_angle_raw_deg(spi0))
+        vals1.append(read_angle_raw_deg(spi1))
+        time.sleep(ZERO_SAMPLE_DELAY_SEC)
+
+    zero0 = float(np.mean(vals0))
+    zero1 = float(np.mean(vals1))
+
+    print(f"[INFO] Encoder zero offsets: encoder0={zero0:.3f} deg, encoder1={zero1:.3f} deg", flush=True)
+    return zero0, zero1
+
+
+# MODEL B GEOMETRY
+
+def Rx(t):
+    c, s = np.cos(t), np.sin(t)
+    return np.array([
+        [1, 0, 0],
+        [0, c, -s],
+        [0, s, c],
+    ], dtype=float)
+
+
+def Ry(t):
+    c, s = np.cos(t), np.sin(t)
+    return np.array([
+        [c, 0, s],
+        [0, 1, 0],
+        [-s, 0, c],
+    ], dtype=float)
+
+
+def encoder_xyz_model_B(swing1_deg, swing2_deg):
+
+    t0 = np.deg2rad(swing1_deg)
+    t1 = np.deg2rad(swing2_deg)
+
+    center = np.array([0.0, 0.0, ENCODER_OFFSET_MM / 2.0])
+    radius = ROPE_LENGTH_MM + ENCODER_OFFSET_MM / 2.0
+
+    r_eff = np.array([0.0, 0.0, radius])
+    xyz = center + Rx(t0) @ (Ry(t1) @ r_eff)
+
+    return xyz, center, radius
+
+
+def xyz_to_angles_B(xyz):
+    center = np.array([0.0, 0.0, ENCODER_OFFSET_MM / 2.0])
+    x, y, z = xyz - center
+
+    theta1 = np.arctan2(x, np.sqrt(y*y + z*z))
+    theta0 = np.arctan2(-y, z)
+
+    return float(np.rad2deg(theta0)), float(np.rad2deg(theta1))
+
+
+# DLT P → RAY → SPHERE
+
+def camera_center_from_P(P):
+    _, _, Vt = np.linalg.svd(P)
+    C = Vt[-1]
+    C = C / C[3]
+    return C[:3]
+
+
+def pixel_to_ray_from_P(P, u, v, C_cam=None):
+    x = np.array([u, v, 1.0], dtype=float)
+
+    if C_cam is None:
+        C_cam = camera_center_from_P(P)
+
+    X0_h = np.linalg.pinv(P) @ x
+    X0_h = X0_h / X0_h[3]
+    X0 = X0_h[:3]
+
+    d = X0 - C_cam
+    d = d / np.linalg.norm(d)
+
+    return C_cam, d
+
+
+def intersect_ray_sphere(C, d, center, radius):
+    q = C - center
+
+    a = float(d @ d)
+    b = float(2.0 * (d @ q))
+    c = float(q @ q - radius**2)
+
+    disc = b*b - 4*a*c
+    if disc < 0:
+        return None, "Ray missed sphere"
+
+    sd = np.sqrt(disc)
+
+    l1 = (-b - sd) / (2*a)
+    l2 = (-b + sd) / (2*a)
+
+    P1 = C + l1*d
+    P2 = C + l2*d
+
+    chosen = P1 if (P1 - center)[2] > (P2 - center)[2] else P2
+
+    return chosen, ""
+
+
+# TWIST GEOMETRY — REALTIME VERSION OF twistie.py
+
+def intersect_ray_plane(C, d, plane_point, plane_normal):
+    denom = float(d @ plane_normal)
+    if abs(denom) < 1e-9:
+        return None, "Ray nearly parallel to tangent plane"
+
+    lam = float(((plane_point - C) @ plane_normal) / denom)
+    return C + lam * d, ""
+
+
+def normalize(v):
+    n = float(np.linalg.norm(v))
+    if n < 1e-9:
+        return None
+    return v / n
+
+
+def wrap_deg(angle):
+    return (angle + 180.0) % 360.0 - 180.0
+
+
+class RealtimeSwingTwistKF:
+
+
+    def __init__(self):
+        self.x = np.zeros((6, 1), dtype=float)
+
+
+        self.P = np.eye(6, dtype=float) * 10.0
+
+
+        self.Q = np.diag([
+            0.05,
+            0.05,
+            0.10,
+            0.50,
+            0.50,
+            1.00,
+        ]).astype(float)
+
+
+        self.R = np.diag([
+            2.0,
+            2.0,
+            4.0,
+        ]).astype(float)
+
+        self.H = np.array([
+            [1, 0, 0, 0, 0, 0],
+            [0, 1, 0, 0, 0, 0],
+            [0, 0, 1, 0, 0, 0],
+        ], dtype=float)
+
+        self.initialized = False
+
+    def initialize(self, s1, s2, twist):
+        self.x[0, 0] = wrap_deg(float(s1))
+        self.x[1, 0] = wrap_deg(float(s2))
+        self.x[2, 0] = wrap_deg(float(twist))
+        self.x[3, 0] = 0.0
+        self.x[4, 0] = 0.0
+        self.x[5, 0] = 0.0
+        self.initialized = True
+
+    def predict(self, dt):
+        dt = float(np.clip(dt, KF_MIN_DT, KF_MAX_DT))
+
+        F = np.array([
+            [1, 0, 0, dt, 0, 0],
+            [0, 1, 0, 0, dt, 0],
+            [0, 0, 1, 0, 0, dt],
+            [0, 0, 0, 1, 0, 0],
+            [0, 0, 0, 0, 1, 0],
+            [0, 0, 0, 0, 0, 1],
+        ], dtype=float)
+
+        self.x = F @ self.x
+        self.x[0, 0] = wrap_deg(self.x[0, 0])
+        self.x[1, 0] = wrap_deg(self.x[1, 0])
+        self.x[2, 0] = wrap_deg(self.x[2, 0])
+
+        self.P = F @ self.P @ F.T + self.Q
+
+    def update(self, s1_meas, s2_meas, twist_meas):
+        z = np.array([
+            [wrap_deg(float(s1_meas))],
+            [wrap_deg(float(s2_meas))],
+            [wrap_deg(float(twist_meas))],
+        ], dtype=float)
+
+        y = z - (self.H @ self.x)
+        y[0, 0] = wrap_deg(y[0, 0])
+        y[1, 0] = wrap_deg(y[1, 0])
+        y[2, 0] = wrap_deg(y[2, 0])
+
+        S = self.H @ self.P @ self.H.T + self.R
+        K = self.P @ self.H.T @ np.linalg.inv(S)
+
+        self.x = self.x + K @ y
+        self.x[0, 0] = wrap_deg(self.x[0, 0])
+        self.x[1, 0] = wrap_deg(self.x[1, 0])
+        self.x[2, 0] = wrap_deg(self.x[2, 0])
+
+        I = np.eye(6, dtype=float)
+        self.P = (I - K @ self.H) @ self.P
+
+    def step(self, dt, measurement_available, raw_s1=np.nan, raw_s2=np.nan, raw_twist=np.nan):
+        if not USE_KALMAN_FILTER:
+            return self.empty_state(prediction_only=np.nan, initialized=0)
+
+        if not self.initialized:
+            if measurement_available:
+                self.initialize(raw_s1, raw_s2, raw_twist)
+                return self.get_state(prediction_only=0)
+            return self.empty_state(prediction_only=1, initialized=0)
+
+        self.predict(dt)
+
+        if measurement_available:
+            self.update(raw_s1, raw_s2, raw_twist)
+            return self.get_state(prediction_only=0)
+
+        return self.get_state(prediction_only=1)
+
+    def get_state(self, prediction_only):
+        return {
+            "kf_initialized": 1,
+            "kf_prediction_only": int(prediction_only),
+            "kf_swing_angle_1_deg": float(self.x[0, 0]),
+            "kf_swing_angle_2_deg": float(self.x[1, 0]),
+            "kf_twist_deg": float(self.x[2, 0]),
+            "kf_swing_angle_1_rate_deg_s": float(self.x[3, 0]),
+            "kf_swing_angle_2_rate_deg_s": float(self.x[4, 0]),
+            "kf_twist_rate_deg_s": float(self.x[5, 0]),
+        }
+
+    def empty_state(self, prediction_only, initialized):
+        return {
+            "kf_initialized": int(initialized),
+            "kf_prediction_only": int(prediction_only),
+            "kf_swing_angle_1_deg": np.nan,
+            "kf_swing_angle_2_deg": np.nan,
+            "kf_twist_deg": np.nan,
+            "kf_swing_angle_1_rate_deg_s": np.nan,
+            "kf_swing_angle_2_rate_deg_s": np.nan,
+            "kf_twist_rate_deg_s": np.nan,
+        }
+
+
+def weighted_circular_mean_deg(angles_deg, weights=None):
+    angles_deg = np.asarray(angles_deg, dtype=float)
+
+    if weights is None:
+        weights = np.ones_like(angles_deg, dtype=float)
+    else:
+        weights = np.asarray(weights, dtype=float)
+
+    good = np.isfinite(angles_deg) & np.isfinite(weights) & (weights > 0)
+    if not np.any(good):
+        return np.nan, np.nan
+
+    a = np.deg2rad(angles_deg[good])
+    w = weights[good]
+
+    s = float(np.sum(w * np.sin(a)))
+    c = float(np.sum(w * np.cos(a)))
+    wsum = float(np.sum(w))
+
+    mean = float(np.rad2deg(np.arctan2(s, c)))
+    strength = float(np.sqrt(s*s + c*c) / wsum) if wsum > 0 else np.nan
+
+    return mean, strength
+
+
+def world_to_rotated_spherical_frame(v_world):
+
+    xw, yw, zw = v_world
+    return np.array([zw, yw, xw], dtype=float)
+
+
+def rotated_spherical_to_world(v_sph):
+    xs, ys, zs = v_sph
+    return np.array([zs, ys, xs], dtype=float)
+
+
+def rotated_textbook_spherical_basis(Pc, center):
+    r_world = Pc - center
+    r_sph = world_to_rotated_spherical_frame(r_world)
+
+    r = float(np.linalg.norm(r_sph))
+    if r < 1e-9:
+        return None, "Bad spherical radius"
+
+    xs, ys, zs = r_sph
+
+    theta = np.arccos(np.clip(zs / r, -1.0, 1.0))
+    phi = np.arctan2(ys, xs)
+
+    r_hat_s = np.array([
+        np.sin(theta) * np.cos(phi),
+        np.sin(theta) * np.sin(phi),
+        np.cos(theta),
+    ], dtype=float)
+
+    theta_hat_s = np.array([
+        np.cos(theta) * np.cos(phi),
+        np.cos(theta) * np.sin(phi),
+        -np.sin(theta),
+    ], dtype=float)
+
+    phi_hat_s = np.array([
+        -np.sin(phi),
+        np.cos(phi),
+        0.0,
+    ], dtype=float)
+
+    r_hat_w = normalize(rotated_spherical_to_world(r_hat_s))
+    theta_hat_w = normalize(rotated_spherical_to_world(theta_hat_s))
+    phi_hat_w = normalize(rotated_spherical_to_world(phi_hat_s))
+
+    if r_hat_w is None or theta_hat_w is None or phi_hat_w is None:
+        return None, "Could not normalize spherical basis"
+
+    return (r_hat_w, theta_hat_w, phi_hat_w, float(np.rad2deg(theta)), float(np.rad2deg(phi))), ""
+
+
+def signed_angle_about_axis(ref, vec, axis):
+    ref = normalize(ref)
+    vec = normalize(vec)
+    axis = normalize(axis)
+
+    if ref is None or vec is None or axis is None:
+        return np.nan
+
+    x = float(ref @ vec)
+    y = float(axis @ np.cross(ref, vec))
+    return float(np.rad2deg(np.arctan2(y, x)))
+
+
+def compute_single_tab_twist_from_existing_center(P, C_cam, Pc, r_hat, theta_hat, phi_hat, tab_uv, reference="phi"):
+
+    u2, v2 = tab_uv
+
+    C2, d2 = pixel_to_ray_from_P(P, u2, v2, C_cam=C_cam)
+    X_tab, err = intersect_ray_plane(C2, d2, Pc, r_hat)
+    if X_tab is None:
+        return None, err
+
+    v_tab = X_tab - Pc
+    v_tab = v_tab - float(v_tab @ r_hat) * r_hat
+    v_tab = normalize(v_tab)
+    if v_tab is None:
+        return None, "Bad center-to-tab vector"
+
+    ref_name = reference.lower().strip()
+    if ref_name == "phi":
+        ref = phi_hat
+    elif ref_name == "theta":
+        ref = theta_hat
+    else:
+        return None, "TWIST_REFERENCE must be 'phi' or 'theta'"
+
+    twist_raw = signed_angle_about_axis(ref, v_tab, r_hat)
+
+    return {
+        "twist_deg": twist_raw,
+        "tab_X_mm": X_tab[0],
+        "tab_Y_mm": X_tab[1],
+        "tab_Z_mm": X_tab[2],
+        "vtab_x": v_tab[0],
+        "vtab_y": v_tab[1],
+        "vtab_z": v_tab[2],
+    }, ""
+
+
+def compute_twist_from_center_and_tabs(P, C_cam, center_uv, tab_uvs, tab_weights, sphere_center, sphere_radius, reference="phi"):
+
+    u1, v1 = center_uv
+
+    C1, d1 = pixel_to_ray_from_P(P, u1, v1, C_cam=C_cam)
+    Pc, err = intersect_ray_sphere(C1, d1, sphere_center, sphere_radius)
+    if Pc is None:
+        return None, err
+
+    basis, err = rotated_textbook_spherical_basis(Pc, sphere_center)
+    if basis is None:
+        return None, err
+
+    r_hat, theta_hat, phi_hat, theta_rot_deg, phi_rot_deg = basis
+
+    ref_name = reference.lower().strip()
+    if ref_name not in ("phi", "theta"):
+        return None, "TWIST_REFERENCE must be 'phi' or 'theta'"
+
+    twist_angles = []
+    twist_weights = []
+    per_tab = {}
+
+    for idx, uv in tab_uvs.items():
+        one, err = compute_single_tab_twist_from_existing_center(
+            P=P,
+            C_cam=C_cam,
+            Pc=Pc,
+            r_hat=r_hat,
+            theta_hat=theta_hat,
+            phi_hat=phi_hat,
+            tab_uv=uv,
+            reference=ref_name,
+        )
+        if one is None:
+            continue
+
+        twist_i = float(one["twist_deg"])
+        weight_i = float(tab_weights.get(idx, 1.0))
+        if not np.isfinite(twist_i) or not np.isfinite(weight_i) or weight_i <= 0:
+            continue
+
+        twist_angles.append(twist_i)
+        twist_weights.append(weight_i)
+        per_tab[idx] = one
+
+    twist_mean, strength = weighted_circular_mean_deg(twist_angles, twist_weights)
+    if not np.isfinite(twist_mean):
+        return None, "No valid tab keypoints for twist"
+
+    return {
+        "twist_deg_raw": twist_mean,
+        "twist_reference_used": ref_name,
+        "twist_num_tabs_used": len(per_tab),
+        "twist_resultant_strength": strength,
+        "twist_center_X_mm": Pc[0],
+        "twist_center_Y_mm": Pc[1],
+        "twist_center_Z_mm": Pc[2],
+        "rhat_x": r_hat[0],
+        "rhat_y": r_hat[1],
+        "rhat_z": r_hat[2],
+        "theta_hat_x": theta_hat[0],
+        "theta_hat_y": theta_hat[1],
+        "theta_hat_z": theta_hat[2],
+        "phi_hat_x": phi_hat[0],
+        "phi_hat_y": phi_hat[1],
+        "phi_hat_z": phi_hat[2],
+        "rotated_theta_deg": theta_rot_deg,
+        "rotated_phi_deg": phi_rot_deg,
+        "per_tab": per_tab,
+    }, ""
+
+# VIDEO FPS CORRECTION — SAME IDEA AS amen.py
+
+def rewrite_video_with_measured_fps(temp_path: Path, final_path: Path, measured_fps: float):
+
+    if not temp_path.exists():
+        print(f"[WARN] Temp video not found, cannot correct FPS: {temp_path}", flush=True)
+        return
+
+    fps = float(measured_fps) if measured_fps and measured_fps > 1.0 else float(FRAMERATE)
+
+    cap_in = cv2.VideoCapture(str(temp_path))
+    if not cap_in.isOpened():
+        print(f"[WARN] Could not reopen temp video: {temp_path}", flush=True)
+        return
+
+    ret, frame = cap_in.read()
+    if not ret:
+        cap_in.release()
+        print("[WARN] Temp video empty.", flush=True)
+        return
+
+    h, w = frame.shape[:2]
+    out = cv2.VideoWriter(str(final_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+
+    if not out.isOpened():
+        cap_in.release()
+        print(f"[WARN] Could not open corrected writer: {final_path}", flush=True)
+        return
+
+    frame_written = 0
+    out.write(frame)
+    frame_written += 1
+
+    while True:
+        ret, frame = cap_in.read()
+        if not ret:
+            break
+        out.write(frame)
+        frame_written += 1
+
+    cap_in.release()
+    out.release()
+
+
+    print(f"[INFO] Corrected raw video FPS: {fps:.3f}", flush=True)
+    print(f"[INFO] Corrected video frames written: {frame_written}", flush=True)
+
+
+# CSV
+
+HEADER = [
+    "saved_index",
+    "source_frame_index",
+    "elapsed_s",
+    "detected",
+    "box_conf",
+    "kp1_x",
+    "kp1_y",
+    "kp1_conf",
+    "kp2_x",
+    "kp2_y",
+    "kp2_conf",
+    "kp3_x",
+    "kp3_y",
+    "kp3_conf",
+    "kp4_x",
+    "kp4_y",
+    "kp4_conf",
+    "kp5_x",
+    "kp5_y",
+    "kp5_conf",
+    "kp6_x",
+    "kp6_y",
+    "kp6_conf",
+    "twist_reference_used",
+    "twist_deg_raw",
+    "twist_deg_zeroed",
+    "twist_zero_offset_deg",
+    "twist_num_tabs_used",
+    "twist_resultant_strength",
+    "twist_center_X_mm",
+    "twist_center_Y_mm",
+    "twist_center_Z_mm",
+    "kp2_twist_deg",
+    "kp2_tab_X_mm",
+    "kp2_tab_Y_mm",
+    "kp2_tab_Z_mm",
+    "kp2_vtab_x",
+    "kp2_vtab_y",
+    "kp2_vtab_z",
+    "kp3_twist_deg",
+    "kp3_tab_X_mm",
+    "kp3_tab_Y_mm",
+    "kp3_tab_Z_mm",
+    "kp3_vtab_x",
+    "kp3_vtab_y",
+    "kp3_vtab_z",
+    "kp4_twist_deg",
+    "kp4_tab_X_mm",
+    "kp4_tab_Y_mm",
+    "kp4_tab_Z_mm",
+    "kp4_vtab_x",
+    "kp4_vtab_y",
+    "kp4_vtab_z",
+    "kp5_twist_deg",
+    "kp5_tab_X_mm",
+    "kp5_tab_Y_mm",
+    "kp5_tab_Z_mm",
+    "kp5_vtab_x",
+    "kp5_vtab_y",
+    "kp5_vtab_z",
+    "kp6_twist_deg",
+    "kp6_tab_X_mm",
+    "kp6_tab_Y_mm",
+    "kp6_tab_Z_mm",
+    "kp6_vtab_x",
+    "kp6_vtab_y",
+    "kp6_vtab_z",
+    "rhat_x",
+    "rhat_y",
+    "rhat_z",
+    "theta_hat_x",
+    "theta_hat_y",
+    "theta_hat_z",
+    "phi_hat_x",
+    "phi_hat_y",
+    "phi_hat_z",
+    "rotated_theta_deg",
+    "rotated_phi_deg",
+    "encoder0_raw_deg",
+    "encoder1_raw_deg",
+    "encoder0_zero_offset_deg",
+    "encoder1_zero_offset_deg",
+    "swing_angle_1_deg",
+    "swing_angle_2_deg",
+    "encoder_X_mm",
+    "encoder_Y_mm",
+    "encoder_Z_mm",
+    "vision_X_mm",
+    "vision_Y_mm",
+    "vision_Z_mm",
+    "vision_swing_angle_1_deg",
+    "vision_swing_angle_2_deg",
+    "swing_angle_1_error_deg",
+    "swing_angle_2_error_deg",
+    "vision_encoder_error_3D_mm",
+    "sphere_center_X_mm",
+    "sphere_center_Y_mm",
+    "sphere_center_Z_mm",
+    "sphere_radius_mm",
+    "camera_center_X_mm",
+    "camera_center_Y_mm",
+    "camera_center_Z_mm",
+    "kf_initialized",
+    "kf_prediction_only",
+    "kf_swing_angle_1_deg",
+    "kf_swing_angle_2_deg",
+    "kf_twist_deg",
+    "kf_swing_angle_1_rate_deg_s",
+    "kf_swing_angle_2_rate_deg_s",
+    "kf_twist_rate_deg_s",
+    "capture_fps_estimate",
+    "inference_fps_estimate",
+    "latency_ms",
+    "error_msg",
+]
+
+def write_csv_header(csv_path: Path):
+    with open(csv_path, "w", newline="") as f:
+        csv.writer(f).writerow(HEADER)
+
+
+def append_csv_row(csv_path: Path, row: dict):
+    with open(csv_path, "a", newline="") as f:
+        csv.writer(f).writerow([row.get(k, np.nan) for k in HEADER])
+
+
+# OVERLAY
+
+def draw_minimal_overlay(frame, lines):
+    out = frame.copy()
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    fs = 0.70
+    th = 2
+    x, y0, dy = 20, 35, 30
+
+    max_w = 0
+    for line in lines:
+        (w, _), _ = cv2.getTextSize(line, font, fs, th)
+        max_w = max(max_w, w)
+
+    cv2.rectangle(out, (10, 10), (max_w + 40, y0 + dy * len(lines)), (0, 0, 0), -1)
+
+    for i, line in enumerate(lines):
+        cv2.putText(out, line, (x, y0 + i*dy), font, fs, (255, 255, 255), th, cv2.LINE_AA)
+
+    return out
+
+
+# CAMERA SETUP + FOCUS LOCK COPIED FROM amen.py STYLE
+
+def open_camera_and_lock_focus():
+    print("[INFO] Opening CSI camera using GStreamer...", flush=True)
+
+    cap = cv2.VideoCapture(GST_PIPELINE, cv2.CAP_GSTREAMER)
+    if not cap.isOpened():
+        raise RuntimeError("Could not open CSI camera using GStreamer.")
+
+    if USE_FOCUSER:
+        if not HAS_FOCUSER:
+            print("[WARN] USE_FOCUSER=True but Focuser.py could not be imported.", flush=True)
+        else:
+            print(f"[INFO] Setting fixed focus on I2C bus {I2C_BUS} to {FIXED_FOCUS}...", flush=True)
+
+            focuser = Focuser(I2C_BUS)
+
+            for i in range(FOCUS_COMMAND_REPEATS):
+                focuser.set(Focuser.OPT_FOCUS, FIXED_FOCUS)
+                print(f"[INFO] Focus command {i + 1}/{FOCUS_COMMAND_REPEATS} sent: {FIXED_FOCUS}", flush=True)
+                time.sleep(0.1)
+
+            print(f"[INFO] Focus set to {FIXED_FOCUS}, waiting for lens to settle...", flush=True)
+
+            settle_start = time.time()
+            settle_frames = 0
+
+            while time.time() - settle_start < FOCUS_SETTLE_SEC:
+                ret, frame = cap.read()
+                if not ret:
+                    raise RuntimeError("Camera stream failed during focus settling.")
+
+                settle_frames += 1
+
+                if SHOW_PREVIEW:
+                    cv2.imshow("Video Feed", frame)
+                    cv2.waitKey(1)
+
+            print(
+                f"[INFO] Focus locked at {FIXED_FOCUS} "
+                f"(drained {settle_frames} frames over {FOCUS_SETTLE_SEC}s)",
+                flush=True
+            )
+
+    return cap
+
+
+# RAW VIDEO FRAME MAP
+
+FRAME_MAP_HEADER = [
+    "video_frame_index",
+    "elapsed_s",
+    "wall_time_s",
+]
+
+def write_frame_map_header(path: Path):
+    with open(path, "w", newline="") as f:
+        csv.writer(f).writerow(FRAME_MAP_HEADER)
+
+def append_frame_map_row(path: Path, video_frame_index: int, elapsed_s: float, wall_time_s: float):
+    with open(path, "a", newline="") as f:
+        csv.writer(f).writerow([video_frame_index, f"{elapsed_s:.6f}", f"{wall_time_s:.6f}"])
+
+
+# SHARED CAMERA BUFFER THREAD
+
+class LatestFrameBuffer:
+
+
+    def __init__(self, cap, output_dir: Path):
+        self.output_dir = output_dir
+
+        self.cap = cap
+        self.writer = None
+
+        self.lock = threading.Lock()
+        self.latest_frame = None
+        self.latest_index = -1
+        self.latest_time = 0.0
+
+        self.frame_count = 0
+        self.running = False
+        self.start_time = None
+
+        self.temp_video_path = output_dir / RAW_TEMP_VIDEO_NAME
+        self.final_video_path = output_dir / RAW_FINAL_VIDEO_NAME
+        self.frame_map_path = output_dir / FRAME_MAP_CSV_NAME
+        self.written_frame_count = 0
+        self.first_frame_time = None
+        self.last_frame_time = None
+
+    def start(self):
+        if SAVE_RAW_VIDEO:
+            self.writer = cv2.VideoWriter(
+                str(self.temp_video_path),
+                cv2.VideoWriter_fourcc(*"mp4v"),
+                FRAMERATE,
+                (WIDTH, HEIGHT)
+            )
+            if not self.writer.isOpened():
+                raise RuntimeError(f"Could not open raw video writer: {self.temp_video_path}")
+
+            write_frame_map_header(self.frame_map_path)
+
+        self.running = True
+        self.start_time = time.time()
+
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+        self.thread.start()
+
+    def _loop(self):
+        while self.running:
+            ret, frame = self.cap.read()
+            if not ret:
+                continue
+
+            t = time.time() - self.start_time
+
+            if self.writer is not None:
+                self.writer.write(frame)
+                append_frame_map_row(self.frame_map_path, self.frame_count, t, time.time())
+                self.written_frame_count += 1
+                if self.first_frame_time is None:
+                    self.first_frame_time = t
+                self.last_frame_time = t
+
+            with self.lock:
+                self.latest_frame = frame
+                self.latest_index = self.frame_count
+                self.latest_time = t
+
+            self.frame_count += 1
+
+    def get_latest(self):
+        with self.lock:
+            if self.latest_frame is None:
+                return None, -1, 0.0
+
+            return self.latest_frame.copy(), self.latest_index, self.latest_time
+
+    def stop(self):
+        self.running = False
+
+        if hasattr(self, "thread"):
+            self.thread.join(timeout=2.0)
+
+        if self.writer is not None:
+            self.writer.release()
+
+        if self.cap is not None:
+            self.cap.release()
+
+        elapsed = time.time() - self.start_time if self.start_time else 0.0
+        measured_fps_loop = self.frame_count / elapsed if elapsed > 0 else 0.0
+
+        if self.first_frame_time is not None and self.last_frame_time is not None and self.last_frame_time > self.first_frame_time:
+            measured_fps_written = max(1.0, (self.written_frame_count - 1) / (self.last_frame_time - self.first_frame_time))
+        else:
+            measured_fps_written = measured_fps_loop
+
+        measured_fps = measured_fps_written
+
+        print(f"[INFO] Capture loop FPS estimate: {measured_fps_loop:.3f}", flush=True)
+        print(f"[INFO] Video written FPS estimate: {measured_fps_written:.3f}", flush=True)
+        print(f"[INFO] Raw video frame map: {self.frame_map_path}", flush=True)
+
+        if SAVE_RAW_VIDEO:
+            rewrite_video_with_measured_fps(
+                self.temp_video_path,
+                self.final_video_path,
+                measured_fps
+            )
+
+        return measured_fps
+
+
+# OUTPUT FOLDER
+
+def safe_name(name: str) -> str:
+    name = name.strip().replace("/", "_").replace("\\", "_")
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", name) or "realtime_modelB_run"
+
+
+def get_script_dir() -> Path:
+    try:
+        return Path(__file__).resolve().parent
+    except NameError:
+        return Path.cwd()
+
+
+def get_output_dir() -> Path:
+    script_dir = get_script_dir()
+
+    if len(sys.argv) >= 2:
+        folder_name = safe_name(sys.argv[1])
+    else:
+        folder_name = safe_name(input("Enter output folder name: ").strip())
+
+    outdir = script_dir / folder_name
+    outdir.mkdir(parents=True, exist_ok=True)
+    return outdir
+
+
+# MAIN
+
+def main():
+    output_dir = get_output_dir()
+    csv_path = output_dir / CSV_NAME
+
+    print("=" * 60, flush=True)
+    print("MODEL B LOW-LATENCY REALTIME PIPELINE + 5-TAB TWIST + KALMAN — FOCUS FIXED", flush=True)
+    print(f"Output folder: {output_dir}", flush=True)
+    print(f"Model path: {MODEL_PATH}", flush=True)
+    print(f"P matrix path: {P_MATRIX_PATH}", flush=True)
+    print("=" * 60, flush=True)
+
+    P = np.loadtxt(P_MATRIX_PATH).astype(float)
+    if P.shape != (3, 4):
+        raise ValueError(f"P matrix must be 3x4. Got {P.shape}")
+
+    C_cam = camera_center_from_P(P)
+    print(f"[INFO] Camera center from P: {C_cam}", flush=True)
+
+    cap = open_camera_and_lock_focus()
+
+    spi0 = open_encoder(ENCODER0_CS)
+    spi1 = open_encoder(ENCODER1_CS)
+    zero0, zero1 = zero_encoders(spi0, spi1)
+
+    print("[INFO] Loading YOLO model...", flush=True)
+    model = YOLO(MODEL_PATH, task="pose")
+
+    try:
+        model.to("cuda")
+        device_arg = "cuda"
+        print("[INFO] YOLO using CUDA", flush=True)
+    except Exception:
+        device_arg = None
+        print("[WARN] Could not force CUDA. Using default device.", flush=True)
+
+    write_csv_header(csv_path)
+
+    annotated_writer = None
+    annotated_video_path = output_dir / ANNOTATED_VIDEO_NAME
+    frames_dir = output_dir / INFERENCE_FRAMES_DIR_NAME
+    if SAVE_ANNOTATED_VIDEO:
+
+
+        annotated_writer = cv2.VideoWriter(
+            str(annotated_video_path),
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            max(1.0, FRAMERATE / max(1, INFER_EVERY_N_CAPTURED_FRAMES)),
+            (WIDTH, HEIGHT),
+        )
+        if not annotated_writer.isOpened():
+            raise RuntimeError(f"Could not open annotated video writer: {annotated_video_path}")
+
+    if SAVE_INFERENCE_FRAMES:
+        frames_dir.mkdir(parents=True, exist_ok=True)
+
+    buffer = LatestFrameBuffer(cap, output_dir)
+    buffer.start()
+
+    print("[INFO] Realtime started. Press ESC to stop.", flush=True)
+
+    last_processed_frame_idx = -1
+    saved_index = 0
+    last_valid = None
+    inference_counter = 0
+    inference_start = time.time()
+    twist_zero_offset = None
+
+
+    kf = RealtimeSwingTwistKF()
+    last_kf_time = None
+
+    try:
+        while True:
+            frame, frame_idx, frame_time = buffer.get_latest()
+
+            if frame is None:
+                time.sleep(0.005)
+                continue
+
+            if frame_idx == last_processed_frame_idx:
+                time.sleep(0.001)
+                continue
+
+
+            if frame_idx % INFER_EVERY_N_CAPTURED_FRAMES != 0:
+                if SHOW_PREVIEW:
+                    display = frame
+
+                    if last_valid is not None and DRAW_OVERLAY:
+                        display = draw_minimal_overlay(display, [
+                            f"Model B | latest frame={frame_idx}",
+                            f"Last XYZ: X={last_valid['vision_X_mm']:+.1f}, Y={last_valid['vision_Y_mm']:+.1f}, Z={last_valid['vision_Z_mm']:+.1f} mm",
+                            f"Last angles: s1={last_valid['vision_swing_angle_1_deg']:+.2f}, s2={last_valid['vision_swing_angle_2_deg']:+.2f} deg",
+                            f"Last twist: raw={last_valid.get('twist_deg_zeroed', np.nan):+.2f}, KF={last_valid.get('kf_twist_deg', np.nan):+.2f} deg",
+                        ])
+
+                    cv2.imshow("Realtime Model B", display)
+
+                    if (cv2.waitKey(1) & 0xFF) == 27:
+                        print("[INFO] ESC pressed.", flush=True)
+                        break
+
+                last_processed_frame_idx = frame_idx
+                continue
+
+            last_processed_frame_idx = frame_idx
+
+            t0_infer = time.time()
+
+            raw0 = read_angle_raw_deg(spi0)
+            raw1 = read_angle_raw_deg(spi1)
+
+            s1 = angle_diff_deg(raw0, zero0)
+            s2 = angle_diff_deg(raw1, zero1)
+
+            row = {k: np.nan for k in HEADER}
+            row.update({
+                "saved_index": saved_index,
+                "source_frame_index": frame_idx,
+                "elapsed_s": frame_time,
+
+                "detected": 0,
+
+                "encoder0_raw_deg": raw0,
+                "encoder1_raw_deg": raw1,
+                "encoder0_zero_offset_deg": zero0,
+                "encoder1_zero_offset_deg": zero1,
+
+                "swing_angle_1_deg": s1,
+                "swing_angle_2_deg": s2,
+
+                "camera_center_X_mm": C_cam[0],
+                "camera_center_Y_mm": C_cam[1],
+                "camera_center_Z_mm": C_cam[2],
+
+                "error_msg": "",
+            })
+
+            display = frame.copy()
+
+            try:
+                kwargs = dict(
+                    source=frame,
+                    task="pose",
+                    conf=YOLO_CONF_THRESHOLD,
+                    imgsz=YOLO_IMGSZ,
+                    save=False,
+                    verbose=False,
+                )
+
+                if device_arg is not None:
+                    kwargs["device"] = device_arg
+
+                result = model.predict(**kwargs)[0]
+
+                if result.keypoints is None or len(result.keypoints.xy) == 0:
+                    raise RuntimeError("No YOLO pose detection")
+
+                if result.boxes is not None and len(result.boxes) > 0:
+                    confs = result.boxes.conf.cpu().numpy()
+                    best = int(np.argmax(confs))
+                    row["box_conf"] = float(confs[best])
+                else:
+                    best = 0
+
+                kxy = result.keypoints.xy.cpu().numpy()[best]
+
+                if result.keypoints.conf is not None:
+                    kc = result.keypoints.conf.cpu().numpy()[best]
+                else:
+                    kc = np.full((kxy.shape[0],), np.nan)
+
+                needed_indices = [CENTER_KP_INDEX] + list(TAB_KP_INDICES)
+                if kxy.shape[0] <= max(needed_indices):
+                    raise RuntimeError("YOLO result has fewer keypoints than kp1-kp6")
+
+                u = float(kxy[CENTER_KP_INDEX, 0])
+                v = float(kxy[CENTER_KP_INDEX, 1])
+                kconf = float(kc[CENTER_KP_INDEX]) if len(kc) > CENTER_KP_INDEX else np.nan
+
+                if not np.isfinite(u) or not np.isfinite(v):
+                    raise RuntimeError("center keypoint NaN")
+
+                if np.isfinite(kconf) and kconf < KP_CONF_THRESHOLD:
+                    raise RuntimeError("center keypoint confidence below threshold")
+
+                tab_uvs = {}
+                tab_weights = {}
+                keypoint_log = {
+                    "kp1_x": u,
+                    "kp1_y": v,
+                    "kp1_conf": kconf,
+                }
+
+                for tab_idx in TAB_KP_INDICES:
+                    kp_num = tab_idx + 1
+                    uu = float(kxy[tab_idx, 0])
+                    vv = float(kxy[tab_idx, 1])
+                    cc = float(kc[tab_idx]) if len(kc) > tab_idx else np.nan
+
+                    keypoint_log[f"kp{kp_num}_x"] = uu
+                    keypoint_log[f"kp{kp_num}_y"] = vv
+                    keypoint_log[f"kp{kp_num}_conf"] = cc
+
+                    if not np.isfinite(uu) or not np.isfinite(vv):
+                        continue
+                    if np.isfinite(cc) and cc < KP_CONF_THRESHOLD:
+                        continue
+
+                    tab_uvs[tab_idx] = (uu, vv)
+                    tab_weights[tab_idx] = cc if np.isfinite(cc) else 1.0
+
+                if len(tab_uvs) == 0:
+                    raise RuntimeError("No valid tab keypoints kp2-kp6 for twist")
+
+                encoder_xyz, sphere_center, sphere_radius = encoder_xyz_model_B(s1, s2)
+
+                C_ray, d_ray = pixel_to_ray_from_P(P, u, v, C_cam=C_cam)
+                vision_xyz, sphere_err = intersect_ray_sphere(C_ray, d_ray, sphere_center, sphere_radius)
+
+                if vision_xyz is None:
+                    raise RuntimeError(sphere_err)
+
+                vs1, vs2 = xyz_to_angles_B(vision_xyz)
+
+                diff = vision_xyz - encoder_xyz
+                err3 = float(np.linalg.norm(diff))
+
+                twist, twist_err = compute_twist_from_center_and_tabs(
+                    P=P,
+                    C_cam=C_cam,
+                    center_uv=(u, v),
+                    tab_uvs=tab_uvs,
+                    tab_weights=tab_weights,
+                    sphere_center=sphere_center,
+                    sphere_radius=sphere_radius,
+                    reference=TWIST_REFERENCE,
+                )
+                if twist is None:
+                    raise RuntimeError(twist_err)
+
+                if twist_zero_offset is None and np.isfinite(twist["twist_deg_raw"]):
+                    twist_zero_offset = float(twist["twist_deg_raw"])
+
+                twist_zeroed = wrap_deg(float(twist["twist_deg_raw"]) - float(twist_zero_offset))
+
+                latency_ms = (time.time() - t0_infer) * 1000.0
+
+
+                current_kf_time = float(frame_time)
+                if last_kf_time is None:
+                    dt_kf = KF_DEFAULT_DT
+                else:
+                    dt_kf = current_kf_time - last_kf_time
+                last_kf_time = current_kf_time
+                dt_kf = float(np.clip(dt_kf, KF_MIN_DT, KF_MAX_DT))
+
+                kf_state = kf.step(
+                    dt=dt_kf,
+                    measurement_available=True,
+                    raw_s1=vs1,
+                    raw_s2=vs2,
+                    raw_twist=twist_zeroed,
+                )
+
+                inference_counter += 1
+                infer_elapsed = time.time() - inference_start
+                infer_fps = inference_counter / infer_elapsed if infer_elapsed > 0 else 0.0
+                capture_fps = buffer.frame_count / (time.time() - buffer.start_time) if buffer.start_time else 0.0
+
+                per_tab_log = {}
+                for tab_idx, tab_data in twist["per_tab"].items():
+                    kp_num = tab_idx + 1
+                    per_tab_log[f"kp{kp_num}_twist_deg"] = tab_data["twist_deg"]
+                    per_tab_log[f"kp{kp_num}_tab_X_mm"] = tab_data["tab_X_mm"]
+                    per_tab_log[f"kp{kp_num}_tab_Y_mm"] = tab_data["tab_Y_mm"]
+                    per_tab_log[f"kp{kp_num}_tab_Z_mm"] = tab_data["tab_Z_mm"]
+                    per_tab_log[f"kp{kp_num}_vtab_x"] = tab_data["vtab_x"]
+                    per_tab_log[f"kp{kp_num}_vtab_y"] = tab_data["vtab_y"]
+                    per_tab_log[f"kp{kp_num}_vtab_z"] = tab_data["vtab_z"]
+
+                row.update({
+                    "detected": 1,
+
+                    **keypoint_log,
+                    **per_tab_log,
+                    **kf_state,
+
+                    "twist_reference_used": twist["twist_reference_used"],
+                    "twist_deg_raw": twist["twist_deg_raw"],
+                    "twist_deg_zeroed": twist_zeroed,
+                    "twist_zero_offset_deg": twist_zero_offset,
+                    "twist_num_tabs_used": twist["twist_num_tabs_used"],
+                    "twist_resultant_strength": twist["twist_resultant_strength"],
+                    "twist_center_X_mm": twist["twist_center_X_mm"],
+                    "twist_center_Y_mm": twist["twist_center_Y_mm"],
+                    "twist_center_Z_mm": twist["twist_center_Z_mm"],
+                    "rhat_x": twist["rhat_x"],
+                    "rhat_y": twist["rhat_y"],
+                    "rhat_z": twist["rhat_z"],
+                    "theta_hat_x": twist["theta_hat_x"],
+                    "theta_hat_y": twist["theta_hat_y"],
+                    "theta_hat_z": twist["theta_hat_z"],
+                    "phi_hat_x": twist["phi_hat_x"],
+                    "phi_hat_y": twist["phi_hat_y"],
+                    "phi_hat_z": twist["phi_hat_z"],
+                    "rotated_theta_deg": twist["rotated_theta_deg"],
+                    "rotated_phi_deg": twist["rotated_phi_deg"],
+
+                    "encoder_X_mm": encoder_xyz[0],
+                    "encoder_Y_mm": encoder_xyz[1],
+                    "encoder_Z_mm": encoder_xyz[2],
+
+                    "vision_X_mm": vision_xyz[0],
+                    "vision_Y_mm": vision_xyz[1],
+                    "vision_Z_mm": vision_xyz[2],
+
+                    "vision_swing_angle_1_deg": vs1,
+                    "vision_swing_angle_2_deg": vs2,
+
+                    "swing_angle_1_error_deg": vs1 - s1,
+                    "swing_angle_2_error_deg": vs2 - s2,
+
+                    "vision_encoder_error_3D_mm": err3,
+
+                    "sphere_center_X_mm": sphere_center[0],
+                    "sphere_center_Y_mm": sphere_center[1],
+                    "sphere_center_Z_mm": sphere_center[2],
+                    "sphere_radius_mm": sphere_radius,
+
+                    "capture_fps_estimate": capture_fps,
+                    "inference_fps_estimate": infer_fps,
+                    "latency_ms": latency_ms,
+                })
+
+                last_valid = row.copy()
+
+                if DRAW_OVERLAY:
+                    center_pt = (int(round(u)), int(round(v)))
+                    cv2.circle(display, center_pt, 8, (255, 255, 255), -1, cv2.LINE_AA)
+                    cv2.circle(display, center_pt, 12, (0, 0, 0), 2, cv2.LINE_AA)
+
+                    for tab_idx, (uu, vv) in tab_uvs.items():
+                        tab_pt = (int(round(uu)), int(round(vv)))
+                        cv2.circle(display, tab_pt, 5, (255, 255, 255), -1, cv2.LINE_AA)
+                        cv2.circle(display, tab_pt, 8, (0, 0, 0), 2, cv2.LINE_AA)
+                        cv2.line(display, center_pt, tab_pt, (255, 255, 255), 1, cv2.LINE_AA)
+
+            except Exception as e:
+                row["error_msg"] = str(e)
+
+
+                current_kf_time = float(frame_time)
+                if last_kf_time is None:
+                    dt_kf = KF_DEFAULT_DT
+                else:
+                    dt_kf = current_kf_time - last_kf_time
+                last_kf_time = current_kf_time
+                dt_kf = float(np.clip(dt_kf, KF_MIN_DT, KF_MAX_DT))
+
+                kf_state = kf.step(
+                    dt=dt_kf,
+                    measurement_available=False,
+                )
+                row.update(kf_state)
+
+            append_csv_row(csv_path, row)
+            saved_index += 1
+
+            if SHOW_PREVIEW:
+                if last_valid is not None and DRAW_OVERLAY:
+                    display = draw_minimal_overlay(display, [
+                        f"Model B | capFPS={row.get('capture_fps_estimate', np.nan):.1f} infFPS={row.get('inference_fps_estimate', np.nan):.1f}",
+                        f"Vision XYZ: X={last_valid['vision_X_mm']:+.1f}, Y={last_valid['vision_Y_mm']:+.1f}, Z={last_valid['vision_Z_mm']:+.1f} mm",
+                        f"Vision angle: s1={last_valid['vision_swing_angle_1_deg']:+.2f}, s2={last_valid['vision_swing_angle_2_deg']:+.2f} deg",
+                        f"Twist: raw={last_valid.get('twist_deg_raw', np.nan):+.2f}, zeroed={last_valid.get('twist_deg_zeroed', np.nan):+.2f}, KF={last_valid.get('kf_twist_deg', np.nan):+.2f} deg",
+                        f"Encoder angle: s1={s1:+.2f}, s2={s2:+.2f} deg",
+                        f"3D err={last_valid['vision_encoder_error_3D_mm']:.1f} mm latency={last_valid['latency_ms']:.1f} ms",
+                    ])
+                else:
+                    display = draw_minimal_overlay(display, [
+                        "Model B",
+                        f"Status: {row.get('error_msg', 'waiting')}",
+                    ])
+
+                if SAVE_ANNOTATED_VIDEO and annotated_writer is not None:
+                    annotated_writer.write(display)
+
+                if SAVE_INFERENCE_FRAMES:
+                    cv2.imwrite(str(frames_dir / f"infer_{saved_index:06d}_src_{frame_idx:06d}.jpg"), display)
+
+                cv2.imshow("Realtime Model B", display)
+
+                if (cv2.waitKey(1) & 0xFF) == 27:
+                    print("[INFO] ESC pressed.", flush=True)
+                    break
+
+    except KeyboardInterrupt:
+        print("[INFO] Ctrl+C received.", flush=True)
+
+    finally:
+        measured_capture_fps = buffer.stop()
+
+        if annotated_writer is not None:
+            annotated_writer.release()
+
+        try:
+            spi0.close()
+            spi1.close()
+        except Exception:
+            pass
+
+        cv2.destroyAllWindows()
+
+    print("\n================ DONE ================", flush=True)
+    print(f"CSV saved to: {csv_path}", flush=True)
+    print(f"Raw video saved to: {output_dir / RAW_FINAL_VIDEO_NAME}", flush=True)
+    print(f"Raw video frame map saved to: {output_dir / FRAME_MAP_CSV_NAME}", flush=True)
+    if SAVE_ANNOTATED_VIDEO:
+        print(f"Annotated inference video saved to: {annotated_video_path}", flush=True)
+    if SAVE_INFERENCE_FRAMES:
+        print(f"Inference frames saved to: {frames_dir}", flush=True)
+    print(f"Measured capture FPS: {measured_capture_fps:.2f}", flush=True)
+    print("======================================", flush=True)
+
+
+if __name__ == "__main__":
+    main()
