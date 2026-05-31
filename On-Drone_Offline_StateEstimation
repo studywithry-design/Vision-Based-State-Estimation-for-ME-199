@@ -1,0 +1,956 @@
+#On-Drone Offline Reprocessing
+
+
+import csv
+import math
+import time
+from pathlib import Path
+
+import cv2
+import numpy as np
+from ultralytics import YOLO
+
+
+# SETTINGS — edit only if needed
+
+DEFAULT_MODEL_PATH = "path/to/yolov8s-pose_custom.pt"
+DEFAULT_P_MATRIX_PATH = "path/to/projmatrix.txt"
+
+REALTIME_CSV_NAME = "realtime_modelB_results.csv"
+MATCHED_IMAGES_DIR_NAME = "matched_raw_frames"
+OFFLINE_CSV_NAME = "offline_modelB_results.csv"
+OFFLINE_ANNOTATED_DIR_NAME = "annotated_frames_offline"
+OFFLINE_VIDEO_NAME = "offline_annotated_video.mp4"
+
+ROPE_LENGTH_MM = 605.0
+ENCODER_OFFSET_MM = 12.0
+
+YOLO_CONF_THRESHOLD = 0.50
+KP_CONF_THRESHOLD = 0.50
+YOLO_IMGSZ = 960
+NUM_KEYPOINTS = 6
+
+CENTER_KP_INDEX = 0
+TAB_KP_INDICES = [1, 2, 3, 4, 5]
+TWIST_REFERENCE = "phi"
+TWIST_ZERO_SAMPLES = 10
+
+USE_KALMAN_FILTER = True
+KF_DEFAULT_DT = 1.0 / 20.0
+KF_MAX_DT = 0.20
+KF_MIN_DT = 1e-3
+
+SAVE_ANNOTATED_VIDEO = True
+ANNOTATED_VIDEO_OUTPUT_FPS = 30.0
+
+
+TRY_CUDA = True
+
+
+# CSV HEADER — same columns as state(6).py realtime CSV
+
+HEADER = [
+    "saved_index",
+    "source_frame_index",
+    "elapsed_s",
+    "detected",
+    "box_conf",
+    "kp1_x", "kp1_y", "kp1_conf",
+    "kp2_x", "kp2_y", "kp2_conf",
+    "kp3_x", "kp3_y", "kp3_conf",
+    "kp4_x", "kp4_y", "kp4_conf",
+    "kp5_x", "kp5_y", "kp5_conf",
+    "kp6_x", "kp6_y", "kp6_conf",
+    "twist_reference_used",
+    "twist_deg_raw",
+    "twist_deg_zeroed",
+    "twist_zero_offset_deg",
+    "twist_num_tabs_used",
+    "twist_resultant_strength",
+    "twist_center_X_mm",
+    "twist_center_Y_mm",
+    "twist_center_Z_mm",
+    "kp2_twist_deg", "kp2_tab_X_mm", "kp2_tab_Y_mm", "kp2_tab_Z_mm", "kp2_vtab_x", "kp2_vtab_y", "kp2_vtab_z",
+    "kp3_twist_deg", "kp3_tab_X_mm", "kp3_tab_Y_mm", "kp3_tab_Z_mm", "kp3_vtab_x", "kp3_vtab_y", "kp3_vtab_z",
+    "kp4_twist_deg", "kp4_tab_X_mm", "kp4_tab_Y_mm", "kp4_tab_Z_mm", "kp4_vtab_x", "kp4_vtab_y", "kp4_vtab_z",
+    "kp5_twist_deg", "kp5_tab_X_mm", "kp5_tab_Y_mm", "kp5_tab_Z_mm", "kp5_vtab_x", "kp5_vtab_y", "kp5_vtab_z",
+    "kp6_twist_deg", "kp6_tab_X_mm", "kp6_tab_Y_mm", "kp6_tab_Z_mm", "kp6_vtab_x", "kp6_vtab_y", "kp6_vtab_z",
+    "rhat_x", "rhat_y", "rhat_z",
+    "theta_hat_x", "theta_hat_y", "theta_hat_z",
+    "phi_hat_x", "phi_hat_y", "phi_hat_z",
+    "rotated_theta_deg",
+    "rotated_phi_deg",
+    "encoder0_raw_deg",
+    "encoder1_raw_deg",
+    "encoder0_zero_offset_deg",
+    "encoder1_zero_offset_deg",
+    "swing_angle_1_deg",
+    "swing_angle_2_deg",
+    "encoder_X_mm",
+    "encoder_Y_mm",
+    "encoder_Z_mm",
+    "vision_X_mm",
+    "vision_Y_mm",
+    "vision_Z_mm",
+    "vision_swing_angle_1_deg",
+    "vision_swing_angle_2_deg",
+    "swing_angle_1_error_deg",
+    "swing_angle_2_error_deg",
+    "vision_encoder_error_3D_mm",
+    "sphere_center_X_mm",
+    "sphere_center_Y_mm",
+    "sphere_center_Z_mm",
+    "sphere_radius_mm",
+    "camera_center_X_mm",
+    "camera_center_Y_mm",
+    "camera_center_Z_mm",
+    "kf_initialized",
+    "kf_prediction_only",
+    "kf_swing_angle_1_deg",
+    "kf_swing_angle_2_deg",
+    "kf_twist_deg",
+    "kf_swing_angle_1_rate_deg_s",
+    "kf_swing_angle_2_rate_deg_s",
+    "kf_twist_rate_deg_s",
+    "capture_fps_estimate",
+    "inference_fps_estimate",
+    "latency_ms",
+    "matched_image_path",
+    "error_msg",
+]
+
+
+# Utilities
+
+def as_float(x, default=np.nan):
+    try:
+        if x is None or x == "":
+            return default
+        return float(x)
+    except Exception:
+        return default
+
+
+def as_int(x, default=0):
+    try:
+        if x is None or x == "":
+            return default
+        return int(float(x))
+    except Exception:
+        return default
+
+
+def write_csv_header(csv_path: Path):
+    with open(csv_path, "w", newline="") as f:
+        csv.writer(f).writerow(HEADER)
+
+
+def append_csv_row(csv_path: Path, row: dict):
+    with open(csv_path, "a", newline="") as f:
+        csv.writer(f).writerow([row.get(k, np.nan) for k in HEADER])
+
+
+def resolve_path(user_text: str, base_dirs):
+
+    p = Path(user_text.strip().strip('"').strip("'"))
+    if p.exists():
+        return p.resolve()
+    for base in base_dirs:
+        q = Path(base) / p
+        if q.exists():
+            return q.resolve()
+    return p
+
+
+def get_elapsed_value(row_like):
+    return as_float(row_like.get("elapsed_s"), default=np.nan)
+
+
+# Model B geometry copied/adapted from state(6).py
+
+def Rx(t):
+    c, s = np.cos(t), np.sin(t)
+    return np.array([[1, 0, 0], [0, c, -s], [0, s, c]], dtype=float)
+
+
+def Ry(t):
+    c, s = np.cos(t), np.sin(t)
+    return np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]], dtype=float)
+
+
+def encoder_xyz_model_B(swing1_deg, swing2_deg):
+    t0 = np.deg2rad(swing1_deg)
+    t1 = np.deg2rad(swing2_deg)
+
+    center = np.array([0.0, 0.0, ENCODER_OFFSET_MM / 2.0])
+    radius = ROPE_LENGTH_MM + ENCODER_OFFSET_MM / 2.0
+
+    r_eff = np.array([0.0, 0.0, radius])
+    xyz = center + Rx(t0) @ (Ry(t1) @ r_eff)
+    return xyz, center, radius
+
+
+def xyz_to_angles_B(xyz):
+    center = np.array([0.0, 0.0, ENCODER_OFFSET_MM / 2.0])
+    x, y, z = xyz - center
+    theta1 = np.arctan2(x, np.sqrt(y*y + z*z))
+    theta0 = np.arctan2(-y, z)
+    return float(np.rad2deg(theta0)), float(np.rad2deg(theta1))
+
+
+def camera_center_from_P(P):
+    _, _, Vt = np.linalg.svd(P)
+    C = Vt[-1]
+    C = C / C[3]
+    return C[:3]
+
+
+def pixel_to_ray_from_P(P, u, v, C_cam=None):
+    x = np.array([u, v, 1.0], dtype=float)
+    if C_cam is None:
+        C_cam = camera_center_from_P(P)
+    X0_h = np.linalg.pinv(P) @ x
+    X0_h = X0_h / X0_h[3]
+    X0 = X0_h[:3]
+    d = X0 - C_cam
+    d = d / np.linalg.norm(d)
+    return C_cam, d
+
+
+def intersect_ray_sphere(C, d, center, radius):
+    q = C - center
+    a = float(d @ d)
+    b = float(2.0 * (d @ q))
+    c = float(q @ q - radius**2)
+    disc = b*b - 4*a*c
+    if disc < 0:
+        return None, "Ray missed sphere"
+    sd = np.sqrt(disc)
+    l1 = (-b - sd) / (2*a)
+    l2 = (-b + sd) / (2*a)
+    P1 = C + l1*d
+    P2 = C + l2*d
+    chosen = P1 if (P1 - center)[2] > (P2 - center)[2] else P2
+    return chosen, ""
+
+
+def intersect_ray_plane(C, d, plane_point, plane_normal):
+    denom = float(d @ plane_normal)
+    if abs(denom) < 1e-9:
+        return None, "Ray nearly parallel to tangent plane"
+    lam = float(((plane_point - C) @ plane_normal) / denom)
+    return C + lam * d, ""
+
+
+def normalize(v):
+    n = float(np.linalg.norm(v))
+    if n < 1e-9:
+        return None
+    return v / n
+
+
+def wrap_deg(angle):
+    if not np.isfinite(angle):
+        return np.nan
+    return (float(angle) + 180.0) % 360.0 - 180.0
+
+
+def weighted_circular_mean_deg(angles_deg, weights=None):
+    angles_deg = np.asarray(angles_deg, dtype=float)
+    if weights is None:
+        weights = np.ones_like(angles_deg, dtype=float)
+    else:
+        weights = np.asarray(weights, dtype=float)
+    good = np.isfinite(angles_deg) & np.isfinite(weights) & (weights > 0)
+    if not np.any(good):
+        return np.nan, np.nan
+    a = np.deg2rad(angles_deg[good])
+    w = weights[good]
+    s = float(np.sum(w * np.sin(a)))
+    c = float(np.sum(w * np.cos(a)))
+    wsum = float(np.sum(w))
+    mean = float(np.rad2deg(np.arctan2(s, c)))
+    strength = float(np.sqrt(s*s + c*c) / wsum) if wsum > 0 else np.nan
+    return mean, strength
+
+
+def world_to_rotated_spherical_frame(v_world):
+    xw, yw, zw = v_world
+    return np.array([zw, yw, xw], dtype=float)
+
+
+def rotated_spherical_to_world(v_sph):
+    xs, ys, zs = v_sph
+    return np.array([zs, ys, xs], dtype=float)
+
+
+def rotated_textbook_spherical_basis(Pc, center):
+    r_world = Pc - center
+    r_sph = world_to_rotated_spherical_frame(r_world)
+    r = float(np.linalg.norm(r_sph))
+    if r < 1e-9:
+        return None, "Bad spherical radius"
+
+    xs, ys, zs = r_sph
+    theta = np.arccos(np.clip(zs / r, -1.0, 1.0))
+    phi = np.arctan2(ys, xs)
+
+    r_hat_s = np.array([
+        np.sin(theta) * np.cos(phi),
+        np.sin(theta) * np.sin(phi),
+        np.cos(theta),
+    ], dtype=float)
+    theta_hat_s = np.array([
+        np.cos(theta) * np.cos(phi),
+        np.cos(theta) * np.sin(phi),
+        -np.sin(theta),
+    ], dtype=float)
+    phi_hat_s = np.array([-np.sin(phi), np.cos(phi), 0.0], dtype=float)
+
+    r_hat_w = normalize(rotated_spherical_to_world(r_hat_s))
+    theta_hat_w = normalize(rotated_spherical_to_world(theta_hat_s))
+    phi_hat_w = normalize(rotated_spherical_to_world(phi_hat_s))
+    if r_hat_w is None or theta_hat_w is None or phi_hat_w is None:
+        return None, "Could not normalize spherical basis"
+    return (r_hat_w, theta_hat_w, phi_hat_w, float(np.rad2deg(theta)), float(np.rad2deg(phi))), ""
+
+
+def signed_angle_about_axis(ref, vec, axis):
+    ref = normalize(ref)
+    vec = normalize(vec)
+    axis = normalize(axis)
+    if ref is None or vec is None or axis is None:
+        return np.nan
+    x = float(ref @ vec)
+    y = float(axis @ np.cross(ref, vec))
+    return float(np.rad2deg(np.arctan2(y, x)))
+
+
+def compute_single_tab_twist_from_existing_center(P, C_cam, Pc, r_hat, theta_hat, phi_hat, tab_uv, reference="phi"):
+    u2, v2 = tab_uv
+    C2, d2 = pixel_to_ray_from_P(P, u2, v2, C_cam=C_cam)
+    X_tab, err = intersect_ray_plane(C2, d2, Pc, r_hat)
+    if X_tab is None:
+        return None, err
+
+    v_tab = X_tab - Pc
+    v_tab = v_tab - float(v_tab @ r_hat) * r_hat
+    v_tab = normalize(v_tab)
+    if v_tab is None:
+        return None, "Bad center-to-tab vector"
+
+    ref_name = reference.lower().strip()
+    if ref_name == "phi":
+        ref = phi_hat
+    elif ref_name == "theta":
+        ref = theta_hat
+    else:
+        return None, "TWIST_REFERENCE must be 'phi' or 'theta'"
+
+    twist_raw = signed_angle_about_axis(ref, v_tab, r_hat)
+    return {
+        "twist_deg": twist_raw,
+        "tab_X_mm": X_tab[0],
+        "tab_Y_mm": X_tab[1],
+        "tab_Z_mm": X_tab[2],
+        "vtab_x": v_tab[0],
+        "vtab_y": v_tab[1],
+        "vtab_z": v_tab[2],
+    }, ""
+
+
+def compute_twist_from_center_and_tabs(P, C_cam, center_uv, tab_uvs, tab_weights, sphere_center, sphere_radius, reference="phi"):
+    u1, v1 = center_uv
+    C1, d1 = pixel_to_ray_from_P(P, u1, v1, C_cam=C_cam)
+    Pc, err = intersect_ray_sphere(C1, d1, sphere_center, sphere_radius)
+    if Pc is None:
+        return None, err
+
+    basis, err = rotated_textbook_spherical_basis(Pc, sphere_center)
+    if basis is None:
+        return None, err
+
+    r_hat, theta_hat, phi_hat, theta_rot_deg, phi_rot_deg = basis
+
+    ref_name = reference.lower().strip()
+    if ref_name not in ("phi", "theta"):
+        return None, "TWIST_REFERENCE must be 'phi' or 'theta'"
+
+    twist_angles = []
+    twist_weights = []
+    per_tab = {}
+
+    for idx, uv in tab_uvs.items():
+        one, err = compute_single_tab_twist_from_existing_center(
+            P=P, C_cam=C_cam, Pc=Pc, r_hat=r_hat,
+            theta_hat=theta_hat, phi_hat=phi_hat, tab_uv=uv, reference=ref_name,
+        )
+        if one is None:
+            continue
+        twist_i = float(one["twist_deg"])
+        weight_i = float(tab_weights.get(idx, 1.0))
+        if not np.isfinite(twist_i) or not np.isfinite(weight_i) or weight_i <= 0:
+            continue
+        twist_angles.append(twist_i)
+        twist_weights.append(weight_i)
+        per_tab[idx] = one
+
+    twist_mean, strength = weighted_circular_mean_deg(twist_angles, twist_weights)
+    if not np.isfinite(twist_mean):
+        return None, "No valid tab keypoints for twist"
+
+    return {
+        "twist_deg_raw": twist_mean,
+        "twist_reference_used": ref_name,
+        "twist_num_tabs_used": len(per_tab),
+        "twist_resultant_strength": strength,
+        "twist_center_X_mm": Pc[0],
+        "twist_center_Y_mm": Pc[1],
+        "twist_center_Z_mm": Pc[2],
+        "rhat_x": r_hat[0], "rhat_y": r_hat[1], "rhat_z": r_hat[2],
+        "theta_hat_x": theta_hat[0], "theta_hat_y": theta_hat[1], "theta_hat_z": theta_hat[2],
+        "phi_hat_x": phi_hat[0], "phi_hat_y": phi_hat[1], "phi_hat_z": phi_hat[2],
+        "rotated_theta_deg": theta_rot_deg,
+        "rotated_phi_deg": phi_rot_deg,
+        "per_tab": per_tab,
+    }, ""
+
+
+# Kalman filter copied/adapted from state(6).py
+
+class OfflineSwingTwistKF:
+    def __init__(self):
+        self.x = np.zeros((6, 1), dtype=float)
+        self.P = np.eye(6, dtype=float) * 10.0
+        self.Q = np.diag([0.05, 0.05, 0.10, 0.50, 0.50, 1.00]).astype(float)
+        self.R = np.diag([2.0, 2.0, 4.0]).astype(float)
+        self.H = np.array([
+            [1, 0, 0, 0, 0, 0],
+            [0, 1, 0, 0, 0, 0],
+            [0, 0, 1, 0, 0, 0],
+        ], dtype=float)
+        self.initialized = False
+
+    def initialize(self, s1, s2, twist):
+        self.x[0, 0] = wrap_deg(float(s1))
+        self.x[1, 0] = wrap_deg(float(s2))
+        self.x[2, 0] = wrap_deg(float(twist))
+        self.x[3, 0] = 0.0
+        self.x[4, 0] = 0.0
+        self.x[5, 0] = 0.0
+        self.initialized = True
+
+    def predict(self, dt):
+        dt = float(np.clip(dt, KF_MIN_DT, KF_MAX_DT))
+        F = np.array([
+            [1, 0, 0, dt, 0, 0],
+            [0, 1, 0, 0, dt, 0],
+            [0, 0, 1, 0, 0, dt],
+            [0, 0, 0, 1, 0, 0],
+            [0, 0, 0, 0, 1, 0],
+            [0, 0, 0, 0, 0, 1],
+        ], dtype=float)
+        self.x = F @ self.x
+        self.x[0, 0] = wrap_deg(self.x[0, 0])
+        self.x[1, 0] = wrap_deg(self.x[1, 0])
+        self.x[2, 0] = wrap_deg(self.x[2, 0])
+        self.P = F @ self.P @ F.T + self.Q
+
+    def update(self, s1_meas, s2_meas, twist_meas):
+        z = np.array([[wrap_deg(float(s1_meas))], [wrap_deg(float(s2_meas))], [wrap_deg(float(twist_meas))]], dtype=float)
+        y = z - (self.H @ self.x)
+        y[0, 0] = wrap_deg(y[0, 0])
+        y[1, 0] = wrap_deg(y[1, 0])
+        y[2, 0] = wrap_deg(y[2, 0])
+        S = self.H @ self.P @ self.H.T + self.R
+        K = self.P @ self.H.T @ np.linalg.inv(S)
+        self.x = self.x + K @ y
+        self.x[0, 0] = wrap_deg(self.x[0, 0])
+        self.x[1, 0] = wrap_deg(self.x[1, 0])
+        self.x[2, 0] = wrap_deg(self.x[2, 0])
+        I = np.eye(6, dtype=float)
+        self.P = (I - K @ self.H) @ self.P
+
+    def step(self, dt, measurement_available, raw_s1=np.nan, raw_s2=np.nan, raw_twist=np.nan):
+        if not USE_KALMAN_FILTER:
+            return self.empty_state(prediction_only=np.nan, initialized=0)
+        if not self.initialized:
+            if measurement_available:
+                self.initialize(raw_s1, raw_s2, raw_twist)
+                return self.get_state(prediction_only=0)
+            return self.empty_state(prediction_only=1, initialized=0)
+        self.predict(dt)
+        if measurement_available:
+            self.update(raw_s1, raw_s2, raw_twist)
+            return self.get_state(prediction_only=0)
+        return self.get_state(prediction_only=1)
+
+    def get_state(self, prediction_only):
+        return {
+            "kf_initialized": 1,
+            "kf_prediction_only": int(prediction_only),
+            "kf_swing_angle_1_deg": float(self.x[0, 0]),
+            "kf_swing_angle_2_deg": float(self.x[1, 0]),
+            "kf_twist_deg": float(self.x[2, 0]),
+            "kf_swing_angle_1_rate_deg_s": float(self.x[3, 0]),
+            "kf_swing_angle_2_rate_deg_s": float(self.x[4, 0]),
+            "kf_twist_rate_deg_s": float(self.x[5, 0]),
+        }
+
+    def empty_state(self, prediction_only, initialized):
+        return {
+            "kf_initialized": int(initialized),
+            "kf_prediction_only": int(prediction_only),
+            "kf_swing_angle_1_deg": np.nan,
+            "kf_swing_angle_2_deg": np.nan,
+            "kf_twist_deg": np.nan,
+            "kf_swing_angle_1_rate_deg_s": np.nan,
+            "kf_swing_angle_2_rate_deg_s": np.nan,
+            "kf_twist_rate_deg_s": np.nan,
+        }
+
+
+# Annotation
+
+def draw_text_overlay(img, row):
+    out = img.copy()
+    lines = [
+        f"offline frame={row.get('saved_index', '')}  t={as_float(row.get('elapsed_s')):.3f}s",
+        f"det={row.get('detected', 0)} conf={as_float(row.get('box_conf')):.3f}",
+        f"vision s1={as_float(row.get('vision_swing_angle_1_deg')):+.2f} s2={as_float(row.get('vision_swing_angle_2_deg')):+.2f} deg",
+        f"twist={as_float(row.get('twist_deg_zeroed')):+.2f} deg  tabs={row.get('twist_num_tabs_used', '')}",
+        f"3D err={as_float(row.get('vision_encoder_error_3D_mm')):.1f} mm",
+    ]
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    fs = 0.70
+    th = 2
+    x, y0, dy = 20, 35, 30
+    max_w = 0
+    for line in lines:
+        (w, _), _ = cv2.getTextSize(line, font, fs, th)
+        max_w = max(max_w, w)
+    cv2.rectangle(out, (10, 10), (max_w + 40, y0 + dy * len(lines)), (0, 0, 0), -1)
+    for i, line in enumerate(lines):
+        cv2.putText(out, line, (x, y0 + i*dy), font, fs, (255, 255, 255), th, cv2.LINE_AA)
+    return out
+
+
+def make_annotated_video_pp_style(annotated_items, video_path, output_fps=ANNOTATED_VIDEO_OUTPUT_FPS):
+
+    if not annotated_items:
+        return
+
+    first = cv2.imread(str(annotated_items[0][0]))
+    if first is None:
+        return
+
+    h, w = first.shape[:2]
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    out = cv2.VideoWriter(str(video_path), fourcc, float(output_fps), (w, h))
+    if not out.isOpened():
+        print(f"[WARN] Could not open video writer: {video_path}")
+        return
+
+    elapsed_prev = None
+    for img_path, elapsed in annotated_items:
+        img = cv2.imread(str(img_path))
+        if img is None:
+            continue
+
+        repeat_frames = 1
+        if elapsed_prev is not None and np.isfinite(elapsed) and np.isfinite(elapsed_prev):
+            dt = max(0.001, float(elapsed) - float(elapsed_prev))
+            repeat_frames = max(1, int(round(dt * float(output_fps))))
+
+        elapsed_prev = elapsed
+
+        for _ in range(repeat_frames):
+            out.write(img)
+
+    out.release()
+
+
+# Main processing
+
+def find_image_for_row(trial_dir: Path, images_dir: Path, old_row: dict):
+    rel = old_row.get("matched_image_path", "")
+    if rel:
+        p = trial_dir / rel
+        if p.exists():
+            return p
+        p2 = Path(rel)
+        if p2.exists():
+            return p2
+        p3 = images_dir / Path(rel).name
+        if p3.exists():
+            return p3
+
+
+    saved_index = as_int(old_row.get("saved_index"), default=-1)
+    if saved_index >= 0:
+        matches = sorted(images_dir.glob(f"csv_{saved_index:06d}_*.jpg"))
+        if matches:
+            return matches[0]
+
+
+    frame_idx = as_int(old_row.get("source_frame_index"), default=-1)
+    if frame_idx >= 0:
+        matches = sorted(images_dir.glob(f"*frame_{frame_idx:06d}_*.jpg"))
+        if matches:
+            return matches[0]
+
+    return None
+
+
+def process_one_row(old_row, img_path, model, P, C_cam, device_arg, kf, last_kf_time_ref, twist_zero_state, start_time_process, processed_count):
+    row = {k: np.nan for k in HEADER}
+
+    elapsed_s = as_float(old_row.get("elapsed_s"))
+    s1 = as_float(old_row.get("swing_angle_1_deg"))
+    s2 = as_float(old_row.get("swing_angle_2_deg"))
+
+    row.update({
+        "saved_index": as_int(old_row.get("saved_index"), processed_count),
+        "source_frame_index": as_int(old_row.get("source_frame_index"), -1),
+        "elapsed_s": elapsed_s,
+        "detected": 0,
+        "encoder0_raw_deg": as_float(old_row.get("encoder0_raw_deg")),
+        "encoder1_raw_deg": as_float(old_row.get("encoder1_raw_deg")),
+        "encoder0_zero_offset_deg": as_float(old_row.get("encoder0_zero_offset_deg")),
+        "encoder1_zero_offset_deg": as_float(old_row.get("encoder1_zero_offset_deg")),
+        "swing_angle_1_deg": s1,
+        "swing_angle_2_deg": s2,
+        "camera_center_X_mm": C_cam[0],
+        "camera_center_Y_mm": C_cam[1],
+        "camera_center_Z_mm": C_cam[2],
+        "matched_image_path": str(Path(MATCHED_IMAGES_DIR_NAME) / img_path.name),
+        "error_msg": "",
+    })
+
+
+    if last_kf_time_ref[0] is None or not np.isfinite(elapsed_s):
+        dt_kf = KF_DEFAULT_DT
+    else:
+        dt_kf = elapsed_s - last_kf_time_ref[0]
+    if np.isfinite(elapsed_s):
+        last_kf_time_ref[0] = elapsed_s
+    dt_kf = float(np.clip(dt_kf, KF_MIN_DT, KF_MAX_DT))
+
+    t0 = time.time()
+    annotated = None
+
+    try:
+        img = cv2.imread(str(img_path))
+        if img is None:
+            raise RuntimeError(f"Could not read image: {img_path}")
+
+        kwargs = dict(
+            source=img,
+            task="pose",
+            conf=YOLO_CONF_THRESHOLD,
+            imgsz=YOLO_IMGSZ,
+            save=False,
+            verbose=False,
+        )
+        if device_arg is not None:
+            kwargs["device"] = device_arg
+        result = model.predict(**kwargs)[0]
+        annotated = result.plot()
+
+        if result.keypoints is None or len(result.keypoints.xy) == 0:
+            raise RuntimeError("No offline YOLO pose detection")
+
+        if result.boxes is not None and len(result.boxes) > 0:
+            confs = result.boxes.conf.cpu().numpy()
+            best = int(np.argmax(confs))
+            row["box_conf"] = float(confs[best])
+        else:
+            best = 0
+
+        kxy = result.keypoints.xy.cpu().numpy()[best]
+        if result.keypoints.conf is not None:
+            kc = result.keypoints.conf.cpu().numpy()[best]
+        else:
+            kc = np.full((kxy.shape[0],), np.nan)
+
+        needed_indices = [CENTER_KP_INDEX] + list(TAB_KP_INDICES)
+        if kxy.shape[0] <= max(needed_indices):
+            raise RuntimeError("YOLO result has fewer keypoints than kp1-kp6")
+
+
+        for py_idx in range(NUM_KEYPOINTS):
+            kp_num = py_idx + 1
+            row[f"kp{kp_num}_x"] = float(kxy[py_idx, 0])
+            row[f"kp{kp_num}_y"] = float(kxy[py_idx, 1])
+            row[f"kp{kp_num}_conf"] = float(kc[py_idx]) if len(kc) > py_idx else np.nan
+
+        u = as_float(row["kp1_x"])
+        v = as_float(row["kp1_y"])
+        kconf = as_float(row["kp1_conf"])
+
+        if not np.isfinite(u) or not np.isfinite(v):
+            raise RuntimeError("center keypoint NaN")
+        if np.isfinite(kconf) and kconf < KP_CONF_THRESHOLD:
+            raise RuntimeError("center keypoint confidence below threshold")
+
+        tab_uvs = {}
+        tab_weights = {}
+        for tab_idx in TAB_KP_INDICES:
+            kp_num = tab_idx + 1
+            uu = as_float(row[f"kp{kp_num}_x"])
+            vv = as_float(row[f"kp{kp_num}_y"])
+            cc = as_float(row[f"kp{kp_num}_conf"])
+            if not np.isfinite(uu) or not np.isfinite(vv):
+                continue
+            if np.isfinite(cc) and cc < KP_CONF_THRESHOLD:
+                continue
+            tab_uvs[tab_idx] = (uu, vv)
+            tab_weights[tab_idx] = cc if np.isfinite(cc) else 1.0
+
+        if len(tab_uvs) == 0:
+            raise RuntimeError("No valid tab keypoints kp2-kp6 for twist")
+        if not np.isfinite(s1) or not np.isfinite(s2):
+            raise RuntimeError("Missing saved encoder swing_angle_1_deg/swing_angle_2_deg in realtime CSV")
+
+        encoder_xyz, sphere_center, sphere_radius = encoder_xyz_model_B(s1, s2)
+
+        C_ray, d_ray = pixel_to_ray_from_P(P, u, v, C_cam=C_cam)
+        vision_xyz, sphere_err = intersect_ray_sphere(C_ray, d_ray, sphere_center, sphere_radius)
+        if vision_xyz is None:
+            raise RuntimeError(sphere_err)
+
+        vs1, vs2 = xyz_to_angles_B(vision_xyz)
+        err3 = float(np.linalg.norm(vision_xyz - encoder_xyz))
+
+        twist, twist_err = compute_twist_from_center_and_tabs(
+            P=P,
+            C_cam=C_cam,
+            center_uv=(u, v),
+            tab_uvs=tab_uvs,
+            tab_weights=tab_weights,
+            sphere_center=sphere_center,
+            sphere_radius=sphere_radius,
+            reference=TWIST_REFERENCE,
+        )
+        if twist is None:
+            raise RuntimeError(twist_err)
+
+
+        if twist_zero_state["offset"] is None and np.isfinite(twist["twist_deg_raw"]):
+            twist_zero_state["buffer"].append(float(twist["twist_deg_raw"]))
+            if len(twist_zero_state["buffer"]) >= TWIST_ZERO_SAMPLES:
+
+                twist_zero_state["offset"] = float(np.mean(twist_zero_state["buffer"]))
+
+        if twist_zero_state["offset"] is not None:
+            twist_zeroed = wrap_deg(float(twist["twist_deg_raw"]) - float(twist_zero_state["offset"]))
+        else:
+            twist_zeroed = np.nan
+
+        kf_measurement_available = np.isfinite(vs1) and np.isfinite(vs2) and np.isfinite(twist_zeroed)
+        kf_state = kf.step(dt=dt_kf, measurement_available=kf_measurement_available, raw_s1=vs1, raw_s2=vs2, raw_twist=twist_zeroed)
+
+        per_tab_log = {}
+        for tab_idx, tab_data in twist["per_tab"].items():
+            kp_num = tab_idx + 1
+            per_tab_log[f"kp{kp_num}_twist_deg"] = tab_data["twist_deg"]
+            per_tab_log[f"kp{kp_num}_tab_X_mm"] = tab_data["tab_X_mm"]
+            per_tab_log[f"kp{kp_num}_tab_Y_mm"] = tab_data["tab_Y_mm"]
+            per_tab_log[f"kp{kp_num}_tab_Z_mm"] = tab_data["tab_Z_mm"]
+            per_tab_log[f"kp{kp_num}_vtab_x"] = tab_data["vtab_x"]
+            per_tab_log[f"kp{kp_num}_vtab_y"] = tab_data["vtab_y"]
+            per_tab_log[f"kp{kp_num}_vtab_z"] = tab_data["vtab_z"]
+
+        infer_elapsed = time.time() - start_time_process
+        inference_fps = (processed_count + 1) / infer_elapsed if infer_elapsed > 0 else 0.0
+
+        row.update({
+            "detected": 1,
+            **per_tab_log,
+            **kf_state,
+            "twist_reference_used": twist["twist_reference_used"],
+            "twist_deg_raw": twist["twist_deg_raw"],
+            "twist_deg_zeroed": twist_zeroed,
+            "twist_zero_offset_deg": twist_zero_state["offset"],
+            "twist_num_tabs_used": twist["twist_num_tabs_used"],
+            "twist_resultant_strength": twist["twist_resultant_strength"],
+            "twist_center_X_mm": twist["twist_center_X_mm"],
+            "twist_center_Y_mm": twist["twist_center_Y_mm"],
+            "twist_center_Z_mm": twist["twist_center_Z_mm"],
+            "rhat_x": twist["rhat_x"], "rhat_y": twist["rhat_y"], "rhat_z": twist["rhat_z"],
+            "theta_hat_x": twist["theta_hat_x"], "theta_hat_y": twist["theta_hat_y"], "theta_hat_z": twist["theta_hat_z"],
+            "phi_hat_x": twist["phi_hat_x"], "phi_hat_y": twist["phi_hat_y"], "phi_hat_z": twist["phi_hat_z"],
+            "rotated_theta_deg": twist["rotated_theta_deg"],
+            "rotated_phi_deg": twist["rotated_phi_deg"],
+            "encoder_X_mm": encoder_xyz[0],
+            "encoder_Y_mm": encoder_xyz[1],
+            "encoder_Z_mm": encoder_xyz[2],
+            "vision_X_mm": vision_xyz[0],
+            "vision_Y_mm": vision_xyz[1],
+            "vision_Z_mm": vision_xyz[2],
+            "vision_swing_angle_1_deg": vs1,
+            "vision_swing_angle_2_deg": vs2,
+            "swing_angle_1_error_deg": vs1 - s1,
+            "swing_angle_2_error_deg": vs2 - s2,
+            "vision_encoder_error_3D_mm": err3,
+            "sphere_center_X_mm": sphere_center[0],
+            "sphere_center_Y_mm": sphere_center[1],
+            "sphere_center_Z_mm": sphere_center[2],
+            "sphere_radius_mm": sphere_radius,
+            "capture_fps_estimate": as_float(old_row.get("capture_fps_estimate")),
+            "inference_fps_estimate": inference_fps,
+            "latency_ms": (time.time() - t0) * 1000.0,
+        })
+
+    except Exception as e:
+        row["error_msg"] = str(e)
+        kf_state = kf.step(dt=dt_kf, measurement_available=False)
+        row.update(kf_state)
+        if annotated is None:
+            img = cv2.imread(str(img_path))
+            annotated = img if img is not None else np.zeros((720, 1280, 3), dtype=np.uint8)
+
+    annotated = draw_text_overlay(annotated, row)
+    return row, annotated
+
+
+def main():
+    script_dir = Path(__file__).resolve().parent
+
+    print("\n=== OFFLINE MODEL B REPROCESSOR FROM state(6).py ===\n")
+
+    trial_text = input("Paste REALTIME TRIAL FOLDER path: \n> ").strip().strip('"').strip("'")
+    trial_dir = Path(trial_text).expanduser().resolve()
+    if not trial_dir.exists():
+        raise FileNotFoundError(f"Trial folder not found: {trial_dir}")
+
+    realtime_csv_path = trial_dir / REALTIME_CSV_NAME
+    if not realtime_csv_path.exists():
+        raise FileNotFoundError(f"Missing {REALTIME_CSV_NAME} inside: {trial_dir}")
+
+    images_dir = trial_dir / MATCHED_IMAGES_DIR_NAME
+    if not images_dir.exists():
+        raise FileNotFoundError(f"Missing {MATCHED_IMAGES_DIR_NAME}/ inside: {trial_dir}")
+
+    model_path = resolve_path(DEFAULT_MODEL_PATH, [trial_dir, script_dir])
+    if not model_path.exists():
+        raise FileNotFoundError(f"YOLO model not found: {model_path}")
+
+    p_path = resolve_path(DEFAULT_P_MATRIX_PATH, [trial_dir, script_dir])
+    if not p_path.exists():
+        raise FileNotFoundError(f"P matrix file not found: {p_path}")
+
+    out_csv_path = trial_dir / OFFLINE_CSV_NAME
+    annotated_dir = trial_dir / OFFLINE_ANNOTATED_DIR_NAME
+    annotated_dir.mkdir(exist_ok=True)
+    out_video_path = trial_dir / OFFLINE_VIDEO_NAME
+
+    print(f"\n[INFO] Trial folder: {trial_dir}")
+    print(f"[INFO] Realtime CSV: {realtime_csv_path}")
+    print(f"[INFO] Images folder: {images_dir}")
+    print(f"[INFO] YOLO model: {model_path}")
+    print(f"[INFO] P matrix: {p_path}")
+    print(f"[INFO] Offline CSV output: {out_csv_path}")
+    print(f"[INFO] Annotated output: {annotated_dir}")
+
+    P = np.loadtxt(p_path).astype(float)
+    if P.shape != (3, 4):
+        raise ValueError(f"P matrix must be 3x4. Got {P.shape}")
+    C_cam = camera_center_from_P(P)
+    print(f"[INFO] Camera center from P: {C_cam}")
+
+    with open(realtime_csv_path, "r", newline="") as f:
+        rows = list(csv.DictReader(f))
+    if not rows:
+        raise RuntimeError("Realtime CSV has no rows.")
+
+    print(f"[INFO] Annotated video will be written pp-style at fixed {ANNOTATED_VIDEO_OUTPUT_FPS:.1f} FPS")
+
+    print("[INFO] Loading YOLO model...")
+    model = YOLO(str(model_path), task="pose")
+    device_arg = None
+    if TRY_CUDA:
+        try:
+            model.to("cuda")
+            device_arg = "cuda"
+            print("[INFO] YOLO using CUDA")
+        except Exception:
+            print("[WARN] CUDA unavailable or failed. Using default device.")
+
+    write_csv_header(out_csv_path)
+
+    kf = OfflineSwingTwistKF()
+    last_kf_time_ref = [None]
+    twist_zero_state = {"offset": None, "buffer": []}
+    annotated_items = []
+    start_time_process = time.time()
+
+    valid_images = 0
+    detected_count = 0
+    error_count = 0
+
+    for i, old_row in enumerate(rows):
+        img_path = find_image_for_row(trial_dir, images_dir, old_row)
+        if img_path is None or not img_path.exists():
+            out_row = {k: np.nan for k in HEADER}
+            out_row.update({
+                "saved_index": as_int(old_row.get("saved_index"), i),
+                "source_frame_index": as_int(old_row.get("source_frame_index"), -1),
+                "elapsed_s": as_float(old_row.get("elapsed_s")),
+                "detected": 0,
+                "matched_image_path": old_row.get("matched_image_path", ""),
+                "error_msg": "Could not find matched image",
+            })
+            append_csv_row(out_csv_path, out_row)
+            error_count += 1
+            print(f"[WARN] {i+1}/{len(rows)} missing image for saved_index={out_row['saved_index']}")
+            continue
+
+        valid_images += 1
+        print(f"[YOLO+STATE] {i+1}/{len(rows)} {img_path.name}")
+
+        out_row, annotated = process_one_row(
+            old_row=old_row,
+            img_path=img_path,
+            model=model,
+            P=P,
+            C_cam=C_cam,
+            device_arg=device_arg,
+            kf=kf,
+            last_kf_time_ref=last_kf_time_ref,
+            twist_zero_state=twist_zero_state,
+            start_time_process=start_time_process,
+            processed_count=i,
+        )
+
+        if int(out_row.get("detected", 0) or 0) == 1:
+            detected_count += 1
+        if str(out_row.get("error_msg", "")):
+            error_count += 1
+
+        append_csv_row(out_csv_path, out_row)
+
+        annotated_name = f"offline_{as_int(out_row.get('saved_index'), i):06d}_{img_path.name}"
+        annotated_path = annotated_dir / annotated_name
+        cv2.imwrite(str(annotated_path), annotated)
+        annotated_items.append((annotated_path, get_elapsed_value(out_row)))
+
+    if SAVE_ANNOTATED_VIDEO:
+        print("[INFO] Writing annotated video using pp.py-style timestamp reconstruction...")
+        make_annotated_video_pp_style(annotated_items, out_video_path, ANNOTATED_VIDEO_OUTPUT_FPS)
+
+    print("\n================ DONE ================")
+    print(f"Rows in realtime CSV:       {len(rows)}")
+    print(f"Images found/processed:     {valid_images}")
+    print(f"Offline detected rows:      {detected_count}")
+    print(f"Rows with errors/warnings:  {error_count}")
+    print(f"Twist zero offset:          {twist_zero_state['offset']}")
+    print(f"Offline CSV saved to:       {out_csv_path}")
+    print(f"Annotated frames saved to:  {annotated_dir}")
+    if SAVE_ANNOTATED_VIDEO:
+        print(f"Annotated video saved to:   {out_video_path}")
+    print("======================================")
+
+
+if __name__ == "__main__":
+    main()
